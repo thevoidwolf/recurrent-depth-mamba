@@ -1,0 +1,9 @@
+# Core dependencies (enough to run the --smoke path on a CPU).
+torch>=2.1
+numpy>=1.21
+
+# For the real results you also need the Mamba-2 kernels, which require a CUDA GPU:
+#   pip install mamba-ssm
+# It is intentionally not listed above because it cannot build on a CPU-only
+# machine. Without it, the model falls back to a slow pure-PyTorch scan that runs
+# the pipeline but does not reproduce the reported numbers.
