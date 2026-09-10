@@ -186,4 +186,4 @@ The backbone is the standard `mamba_ssm.Mamba2` block; every number above comes
 from running the code in this repo on it.
 
 MIT licensed. Built by one person on one GPU, and written to be readable by
-someone who is not.
+non-specialists.
