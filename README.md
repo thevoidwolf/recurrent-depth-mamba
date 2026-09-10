@@ -25,6 +25,22 @@ block applied four times, `block1 -> block1 -> block1 -> block1`. The
 forward pass is just as deep (four steps of computation), but there is only one
 set of weights to store and train, so it is about a quarter of the size.
 
+```mermaid
+flowchart TB
+    subgraph A["baseline: 4 distinct blocks (4x the parameters)"]
+        direction LR
+        e1([embed]) --> b1[block 1] --> b2[block 2] --> b3[block 3] --> b4[block 4] --> h1([head])
+    end
+    subgraph B["recurrent depth: 1 block applied 4x (1/4 the parameters)"]
+        direction LR
+        e2([embed]) --> blk[one shared block] --> h2([head])
+        blk -. "run 4x in a row" .-> blk
+    end
+```
+
+*Same depth of computation either way. The only difference is how many distinct
+sets of weights you pay for.*
+
 I test five configurations, written as `(distinct blocks) x (times each is
 applied)`:
 
