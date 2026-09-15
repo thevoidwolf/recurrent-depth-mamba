@@ -2,7 +2,34 @@
 
 _2026-09-15. Synthetic-task study on the weight-shared looped Mamba-2 in this repo
 (`rd_*` arms in `recurrent_depth/model.py`). All GPU numbers use the real Mamba-2
-kernel._
+kernel. Reproduce via `experiments/diag_2hop.py` and `experiments/diag_nhop.py`._
+
+## Summary (TL;DR)
+
+The arc, and what each step actually established (numbers are chain accuracy unless noted):
+
+1. **Randomized-depth training → depth-robustness, not scaling.** 1-hop recall stays 1.0 at every
+   test-time loop count r (Result 1). A flat line is robustness; it can't show "loops buy reasoning."
+2. **Plain multi-hop can't be learned** — the objective gives no gradient to the intermediate, so the
+   model settles into a keyless "bag of present values" (Result 2).
+3. **CoT / intermediate supervision unlocks composition**, and it's leak-free (free-running eval matches
+   teacher-forced). But under *fixed-depth* training the striking r-curve was mostly train/test mismatch
+   (caught and corrected in Result 6); the genuine per-hop compute is modest (Results 3–6).
+4. **Weight-sharing beats per-hop blocks** on both depth-robustness and composition (Result 4).
+5. **A hop-curriculum reaches ≥6-hop chains with no wall** (cold-start can't do 3). But with CoT the
+   depth lives on the **token tape** — per-lookup compute is ~constant in chain length (Result 7).
+6. **The core genuinely internalises reasoning — but only shallowly.** Soft-weaning (CoT → content-free
+   pause tokens, gradually) puts a **2-hop** chain fully in the recurrent state (value 0.99), and there
+   it is **loop-bound**: r=1 fails (0.06), r=2 works (0.97) — real in-core "loops buy reasoning depth"
+   (Result 8). **3-hop does not fully internalise** here (the last 2 hops do; the 3rd stalls) — in-state
+   reasoning tops out ~2 hops while externalised CoT reaches ≥6 (Result 9).
+
+**Bottom line for Ember:** a looped SSM core can reason multi-hop *below the token layer*, but only
+*shallowly* (≈2 hops in-state here); deep chains are bought by an **external scratchpad**, not by loops
+alone. That supports a reasoning-core-plus-scratchpad/store design, and flags the in-state depth ceiling
+as the thing to push (bigger `d_state`/`d_model`, finer weaning). Method lesson banked: **fixed-depth
+r-sweeps overstate scaling — always confirm with randomized-depth**, and prefer leak-free (free-running)
+evals.
 
 ## Question
 
