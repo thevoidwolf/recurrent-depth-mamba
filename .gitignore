@@ -9,3 +9,5 @@ env/
 # runtime experiment outputs, keep the folder but not its contents
 results/*
 !results/.gitkeep
+# local session working note (not part of the project)
+CONTINUE.md
