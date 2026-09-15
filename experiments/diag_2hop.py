@@ -33,12 +33,19 @@ ap.add_argument("--mix-hop1", type=float, default=0.0,
                      "i.e. the mid entity) instead of Q (answer = 2-hop value); eval is always 2-hop")
 ap.add_argument("--eval-every", type=int, default=250)
 ap.add_argument("--depth-eval", type=int, nargs="*", default=[1, 2, 4, 8, 16])
+ap.add_argument("--cot", action="store_true",
+                help="chain-of-thought supervision: every 2-hop row emits the intermediate "
+                     "mid THEN the value (Q e_t A m_pi(t) v_ans EOS) and the loss adds a CE term "
+                     "on the mid. The value stays 2nd-from-last so ans_pos is unchanged. "
+                     "Overrides --mix-hop1 (the mid is supervised inline on every row).")
+ap.add_argument("--block", default="mamba2", help="'mamba2' (real GPU kernel) or 'fallback' (CPU smoke)")
+ap.add_argument("--device", default="cuda", help="'cuda' or 'cpu' (use with --block fallback for a CPU smoke)")
 ap.add_argument("--ckpt", default=None)
 ap.add_argument("--load", default=None)
 ap.add_argument("--out", default=None)
 args = ap.parse_args()
 
-device = "cuda"
+device = args.device
 torch.backends.cuda.matmul.allow_tf32 = True
 seed_all(args.seed)
 K = args.k
@@ -75,9 +82,12 @@ def sample_raw(B, gen):
     return ents, mids, vals, perm, t
 
 
-def pack(ents, mids, vals, perm, t, hop1=None):
+def pack(ents, mids, vals, perm, t, hop1=None, cot=False):
     """bank1: (e_i, m_pi(i)) ; bank2: (m_i, v_i) ; Q e_t A v_pi(t).  With mids==ents this is
-    exactly tasks._pack_long_2hop.  Rows with hop1[b]=True instead get  Q1 e_t A m_pi(t)."""
+    exactly tasks._pack_long_2hop.  Rows with hop1[b]=True instead get  Q1 e_t A m_pi(t).
+    With cot=True every row is  Q e_t A m_pi(t) v_ans EOS  (intermediate supervised inline);
+    the value stays 2nd-from-last, so ans_pos = len-2 as usual and the caller reads the mid
+    target at ans_pos-1."""
     B = ents.shape[0]
     dest = mids.gather(1, perm)
     def bank(src, dst):
@@ -95,6 +105,12 @@ def pack(ents, mids, vals, perm, t, hop1=None):
     q = ents[ar, t].unsqueeze(1)
     a = vals[ar, perm[ar, t]].unsqueeze(1)
     qtok = torch.full((B, 1), QTOK, dtype=torch.long)
+    if cot:
+        m = mids[ar, perm[ar, t]].unsqueeze(1)               # intermediate entity m_pi(t)
+        parts += [qtok, q, torch.full((B, 1), ATOK, dtype=torch.long), m, a,
+                  torch.full((B, 1), EOS, dtype=torch.long)]
+        seq = torch.cat(parts, 1)
+        return seq, seq.shape[1] - 2                          # value at len-2; mid at len-3
     if hop1 is not None:
         a = torch.where(hop1.unsqueeze(1), mids[ar, perm[ar, t]].unsqueeze(1), a)
         qtok = torch.where(hop1.unsqueeze(1), torch.full_like(qtok, Q1TOK), qtok)
@@ -105,16 +121,16 @@ def pack(ents, mids, vals, perm, t, hop1=None):
     return seq, seq.shape[1] - 2
 
 
-def sample(B, gen, mix=0.0):
+def sample(B, gen, mix=0.0, cot=False):
     raw = sample_raw(B, gen)
-    hop1 = (torch.rand(B, generator=gen) < mix) if mix > 0 else None
-    seq, ans_pos = pack(*raw, hop1=hop1)
+    hop1 = None if cot else ((torch.rand(B, generator=gen) < mix) if mix > 0 else None)
+    seq, ans_pos = pack(*raw, hop1=hop1, cot=cot)
     return seq.to(device), ans_pos, seq[:, ans_pos].to(device), [r.to(device) for r in raw]
 
 
 spec = ARM_SPECS[args.arm]
 cfg = CoreConfig(d_model=256, n_layers=spec["n_distinct"], d_state=64, d_conv=4, expand=2,
-                 headdim=64, block="mamba2", norm_position="post", inject_input=True)
+                 headdim=64, block=args.block, norm_position="post", inject_input=True)
 model = make_recurrent_model(VOCAB, device, cfg, spec["n_distinct"], spec["applies_per_block"])
 print(f"arm={args.arm} K={K} vocab={VOCAB} typed_mid={args.typed_mid} distinct_vals={args.distinct_vals} "
       f"derange={args.derange} swap={args.swap} mix_hop1={args.mix_hop1} random_depth={args.random_depth} "
@@ -130,7 +146,7 @@ def breakdown(r, gen, n_batches=4, batch=512):
              logit_ans=0.0, logit_own=0.0, logit_other_present=0.0, logit_absent=0.0, loss=0.0)
     pos_hist = torch.zeros(K)
     for _ in range(n_batches):
-        seq, ans_pos, target, (ents, mids, vals, perm, t) = sample(batch, gen)
+        seq, ans_pos, target, (ents, mids, vals, perm, t) = sample(batch, gen, cot=args.cot)
         logits = model(seq, applies=r)[:, ans_pos - 1].float()
         B = seq.shape[0]; ar = torch.arange(B, device=device)
         pred = logits.argmax(-1)
@@ -209,6 +225,26 @@ def hop1_eval(r, gen, n_batches=2, batch=512):
     return {"hop1_acc": correct / n, "hop1_pred_in_bank": present / n, "hop1_logit_gap": gap / n}
 
 
+@torch.no_grad()
+def cot_eval(r, gen, n_batches=2, batch=512):
+    """CoT rows (Q e_t A m_pi(t) v_ans EOS), teacher-forced. Scores the intermediate mid
+    at the A position (hop-1) and the value at the mid position (hop-2), and chain-correct
+    = both right. mid high + value high => a free-running scratchpad would chain."""
+    model.eval()
+    n = mid_c = val_c = both_c = 0
+    for _ in range(n_batches):
+        seq, ans_pos, _, _ = sample(batch, gen, cot=True)
+        logits = model(seq, applies=r)
+        mid_pred = logits[:, ans_pos - 2].argmax(-1)      # predict m_pi(t) from the A token
+        val_pred = logits[:, ans_pos - 1].argmax(-1)      # predict v_ans from the mid
+        mid_tgt = seq[:, ans_pos - 1]; val_tgt = seq[:, ans_pos]
+        mc = mid_pred == mid_tgt; vc = val_pred == val_tgt
+        mid_c += mc.sum().item(); val_c += vc.sum().item(); both_c += (mc & vc).sum().item()
+        n += batch
+    model.train()
+    return {"cot_mid_acc": mid_c / n, "cot_val_acc": val_c / n, "cot_chain_acc": both_c / n}
+
+
 def fmt(o):
     return (f"acc={o['correct']:.3f} own(v_t)={o['own']:.3f} rev={o['rev']:.3f} otherPresent={o['other_present']:.3f} "
             f"absentVal={o['absent_value']:.3f} mid={o['mid_tok']:.3f} ent={o['entity']:.3f} ctrl={o['control']:.3f} | "
@@ -232,12 +268,15 @@ else:
         lr = cosine_lr(step, warmup=50, total=args.sched_total, base=3e-4, floor=3e-5)
         for pg in opt.param_groups:
             pg["lr"] = lr
-        seq, ans_pos, target, _ = sample(args.batch, train_gen, mix=args.mix_hop1)
+        seq, ans_pos, target, _ = sample(args.batch, train_gen, mix=args.mix_hop1, cot=args.cot)
         r = None
         if args.random_depth:
             r = int(torch.randint(args.rd_range[0], args.rd_range[1] + 1, (1,), generator=depth_gen).item())
         logits = model(seq, applies=r)
         loss = F.cross_entropy(logits[:, ans_pos - 1], target)
+        if args.cot:
+            # extra CE on the intermediate mid: it sits at ans_pos-1, predicted from ans_pos-2 (the A token)
+            loss = loss + F.cross_entropy(logits[:, ans_pos - 2], seq[:, ans_pos - 1])
         opt.zero_grad(set_to_none=True); loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); opt.step()
         if (step + 1) % args.eval_every == 0 or step + 1 == args.steps:
@@ -245,6 +284,10 @@ else:
             h = hop1_eval(spec["applies_per_block"], eval_gen) if args.mix_hop1 > 0 else {}
             hs = (f" || HOP1 acc={h['hop1_acc']:.3f} inBank={h['hop1_pred_in_bank']:.3f} gap={h['hop1_logit_gap']:.2f}"
                   if h else "")
+            if args.cot:
+                ce = cot_eval(spec["applies_per_block"], eval_gen)
+                hs += (f" || COT mid={ce['cot_mid_acc']:.3f} val={ce['cot_val_acc']:.3f} "
+                       f"chain={ce['cot_chain_acc']:.3f}")
             print(f"step {step+1:5d} loss {loss.item():.3f} [{time.time()-t0:5.0f}s] {fmt(o)}{hs}", flush=True)
     if args.ckpt:
         torch.save(model.state_dict(), args.ckpt)
@@ -259,6 +302,9 @@ for r in args.depth_eval:
     if args.mix_hop1 > 0:
         h = hop1_eval(r, eval_gen); final[r].update(h)
         print(f"       HOP1 (Q1 queries): acc={h['hop1_acc']:.3f} pred_in_bank1={h['hop1_pred_in_bank']:.3f} logit_gap={h['hop1_logit_gap']:.2f}")
+    if args.cot:
+        ce = cot_eval(r, eval_gen); final[r].update(ce)
+        print(f"       COT (teacher-forced): mid={ce['cot_mid_acc']:.3f} val={ce['cot_val_acc']:.3f} chain={ce['cot_chain_acc']:.3f}")
     print(f"       bank-2 slot histogram of predictions (slot 0 = earliest .. {K-1} = latest): "
           + " ".join(f"{p:.2f}" for p in o["pos_hist"]))
 if args.out:

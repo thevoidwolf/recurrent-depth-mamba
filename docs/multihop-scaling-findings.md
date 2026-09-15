@@ -116,19 +116,57 @@ unstabilised over-unrolling signature.
 **Two-hop: total failure** — pure chance (`rank(v_ans)` ≈ 63, acc ≈ 0.008) at every
 `r`, never even loading present-values. Worse than `rd_1x8`'s partial progress.
 
+## Result 5 — CoT / intermediate supervision solves 2-hop, and composition SCALES with depth
+
+The blocker in Result 2 was the missing gradient toward the intermediate, not model
+capacity. So supervise it: every 2-hop row becomes `Q e_t A m_π(t) v_ans EOS`, adding
+a CE term on the intermediate mid (the value stays 2nd-from-last, so all existing eval
+is unchanged). Same `rd_1x8` block, K=16, fixed depth, 10k steps
+(`diag_2hop.py --cot`, run8). We report, per test-time `r`: `mid` (hop-1: predict
+`m_π(t)` at the answer slot), `val` (hop-2: predict `v` from the teacher-forced mid),
+`chain` (both correct).
+
+Training: `mid` groks fast (~step 2000 — full gradient on every row now); `val`/`chain`
+then grok from ~step 5500 and saturate at chain ≈ 0.99.
+
+**Final chain accuracy vs test-time loops `r` — multi-hop scaling, resolved per hop:**
+
+| r | 1 | 2 | 3 | 4 | 6 | 8 | 12 | 16 |
+|---|-----|-----|-----|-----|-----|-----|-----|-----|
+| mid (hop-1) | 0.23 | 0.84 | 0.99 | 1.00 | 1.00 | 1.00 | 0.99 | 0.94 |
+| val (hop-2) | 0.01 | 0.02 | 0.05 | 0.29 | 0.93 | **0.99** | 0.93 | 0.93 |
+| **chain** | 0.00 | 0.01 | 0.05 | 0.29 | 0.93 | **0.99** | 0.91 | 0.87 |
+
+The two hops resolve at **different depths**: hop-1 by r≈3, hop-2 not until r≈6–8.
+Chain accuracy climbs 0.00 → 0.99 as r goes 1 → 8, and holds past the trained depth
+(0.87 at r=16, no collapse). This is the **"more hops need more loops" counting-rule
+signature** — test-time compute buying genuine multi-hop composition, on a single
+weight-shared looped block.
+
+Caveats specific to this result: trained at fixed r=8, so the r-sweep carries a
+train/test-mismatch component — but the *ordered* hop resolution (hop-1 before hop-2)
+argues for genuine sequential depth, not uniform mismatch; and eval is teacher-forced
+on the mid, though mid accuracy ≈ 1.0 at r≥4 so a free-running scratchpad would chain
+the same. Both are named as follow-ups below.
+
 ## Conclusions
 
-1. **Test-time scaling is real — for retrieval depth.** A single looped block turns
-   more test-time loops into higher accuracy on a hard single lookup, and stays
-   robust well past its trained depth. (This is not yet multi-hop *reasoning*.)
-2. **Weight-sharing beats specialisation, on both robustness and composition.** The
-   single looped block (a) transfers its hop-1 retrieval circuit to the 2-hop rows,
-   giving partial composition, and (b) learns an *iterable* transform that
-   extrapolates in depth. Splitting into per-hop blocks removes the transfer and
-   overfits each block to its trained loop count. This **falsifies "one block per
-   hop"** and strengthens the shared-loop recurrent-depth thesis.
-3. **Two-hop composition remains unsolved** — the frontier. Both arms max out below
-   top-1; the shared block only ranks the right answer ~12th.
+1. **Multi-hop reasoning depth scales with test-time loops (the headline).** With
+   intermediate (CoT) supervision, 2-hop chain accuracy rises 0.00 → 0.99 as `r`
+   goes 1 → 8, and the two hops resolve at *different* depths (hop-1 by r≈3, hop-2 by
+   r≈6–8) — the counting-rule signature. Test-time compute buys genuine composition,
+   not just retrieval.
+2. **The plain 2-hop objective cannot learn it** — no gradient toward the
+   intermediate, so the model settles into a keyless bag-of-values. Supervising the
+   intermediate (a scratchpad that rewards it) unlocks composition; capacity was
+   never the limit.
+3. **Weight-sharing beats specialisation.** One looped block gives depth-robustness
+   (holds past trained depth, no collapse) and cross-row transfer; two per-hop blocks
+   are worse on *both* axes (single-hop rise-then-collapse; 2-hop never even starts).
+   This falsifies "one block per hop" and strengthens the shared-loop thesis.
+4. **Retrieval scales too, and stacks.** Even a single far-bank lookup needs ~3 loops
+   (Result 3); those per-hop costs accumulate into the multi-hop depth curve
+   (hop-1 near-bank ≈3, hop-2 far-bank ≈6–8).
 
 ## Caveats
 
@@ -139,15 +177,18 @@ is retrieval iteration, not reasoning-hop scaling; do not over-read it.
 
 ## Next experiments (rank order)
 
-1. **Intermediate / chain-of-thought supervision.** On 2-hop rows, emit the
-   intermediate entity `m_π(t)` *then* the value (`A m_π(t) v_ans EOS`), scoring both
-   positions — an explicit scratchpad that hands the model the chain. Highest
-   expected payoff for actually cracking composition.
-2. **More budget for `rd_1x8` 2-hop.** It was still improving `rank(v_ans)` at 10k
-   steps; longer training and/or a warmer LR tail may complete the grok without any
-   architecture change.
-3. **Depth-position readout / per-apply loss on the shared block.** Encourage each
-   apply to advance one hop, keeping weight-sharing.
+CoT supervision (was #1 here) is done — Result 5. Follow-ups to harden and extend it:
 
-Reproduce: `experiments/diag_2hop.py` (see `--typed-mid --distinct-vals --derange
---swap --mix-hop1` flags); arms in `recurrent_depth/model.py`.
+1. **Randomized-depth training on the CoT task** (r∈[1,8]). Removes the fixed-depth
+   train/test-mismatch confound; the cleanest claim that low-`r` failure is
+   compute-insufficiency rather than train/test skew.
+2. **Free-running (generated-scratchpad) eval.** Let the model emit its own mid and
+   condition hop-2 on it, confirming the chain doesn't lean on the teacher-forced mid.
+3. **3-hop CoT chains.** Does chain accuracy resolve at hop-1 < hop-2 < hop-3 depths —
+   the counting rule at n=3?
+4. **Internalise the scratchpad.** Can the model chain without the explicit
+   intermediate token (latent/implicit CoT), keeping the depth-scaling?
+
+Reproduce: `experiments/diag_2hop.py` (see `--cot --typed-mid --distinct-vals
+--derange --swap` flags, and `--mix-hop1` for the pre-CoT curriculum); arms in
+`recurrent_depth/model.py`. Result JSON/checkpoints land in `results/` (gitignored).
