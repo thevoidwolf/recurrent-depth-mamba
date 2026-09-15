@@ -186,6 +186,35 @@ r≥3≈0.99; free-running vs teacher-forced differ by ≤0.03, free-running occ
 So the teacher-forced result was not leaking: the model genuinely chains on its own
 scratchpad, not on a supplied intermediate.
 
+## Result 7 — a hop-curriculum reaches 6-hop chains (no wall found); cold-start cannot
+
+Result 6's 3-hop failed to cold-start (serial grokking + budget: each hop only learns once the
+previous is stable, so cost grows with depth). Fix: a **curriculum** that ramps the chain length
+H_cur from 1 to N_max, advancing a hop only once the current depth's chain accuracy clears 0.9.
+Fixed vocab (levels 0..N_max) so one model spans all depths; **swapped banks** so every
+already-learned hop keeps its position relative to the query → clean warm-start transfer. run12:
+N_max=6, rd_1x8, randomized-depth CoT, flat LR (`diag_nhop.py --curriculum`).
+
+It climbed 1→2→3→4→5→6 with **no breaking point**, and the per-hop grok **accelerated**
+(hop-2 ~3.5k steps, hop-3 ~5k, hops 4/5/6 ~3k each) as each new hop bootstrapped off a more
+capable base — where cold-start 3-hop (Result 6/run11) never solved hop-3 at all.
+
+**Final per-depth chain accuracy (teacher-forced / free-running):**
+
+| depth | 1 | 2 | 3 | 4 | 5 | 6 |
+|---|-----|-----|-----|-----|-----|-----|
+| TF | 0.998 | 0.997 | 0.997 | 0.996 | 0.986 | 0.968 |
+| FR | 0.999 | 0.998 | 0.996 | 0.994 | 0.983 | 0.975 |
+
+All depths solved; TF ≈ FR everywhere (no leak, genuine chaining at 6 hops). Degradation with
+depth is **graceful** — chain ≈ product of per-hop accuracies (~0.99^N; 0.99^6 ≈ 0.94), eroding
+smoothly rather than cliff-breaking. No hard wall within 6 → the ceiling is >6 (or budget-bound).
+
+**6-hop chain vs test-time r:** r1 0.69 → r2 0.97 → flat (0.92 at r16). ~2 applies suffice even
+for 6 hops: with CoT each hop is one lookup at its own token position, so per-lookup test-time
+compute is ~**independent of chain length**. CoT externalises reasoning depth into the token
+sequence; the loop-count-bound regime is the internalised (no-scratchpad) version.
+
 ## Conclusions
 
 1. **CoT supervision unlocks composition, which then has a genuine but MODEST
@@ -204,9 +233,14 @@ scratchpad, not on a supplied intermediate.
    (holds past trained depth, no collapse) and cross-row transfer; two per-hop blocks
    are worse on *both* axes (single-hop rise-then-collapse; 2-hop never even starts).
    This falsifies "one block per hop" and strengthens the shared-loop thesis.
-4. **Retrieval scales too, and stacks.** Even a single far-bank lookup needs ~3 loops
-   (Result 3); those per-hop costs accumulate into the multi-hop depth curve
-   (hop-1 near-bank ≈3, hop-2 far-bank ≈6–8).
+4. **Retrieval scales too.** Even a single far-bank lookup needs ~2–3 loops (Result 3);
+   with CoT that per-lookup cost is what stacks, not the chain length.
+5. **A hop-curriculum reaches deep chains cold-start cannot.** Ramping chain length and
+   advancing on mastery reached ≥6-hop chains with no wall (graceful ~0.99^N degradation,
+   accelerating per-hop grok), where cold-start couldn't even do 3 (Result 7). With CoT the
+   per-lookup test-time compute is ~constant in chain length — depth is externalised to the
+   token sequence; the loop-count limit lives in the **internalised (no-scratchpad)** version,
+   the open frontier.
 
 ## Caveats
 
@@ -217,13 +251,16 @@ is retrieval iteration, not reasoning-hop scaling; do not over-read it.
 
 ## Next experiments (rank order)
 
-CoT supervision (Result 5), its airtight randomized-depth version (Result 6), and the
-free-running leak check (in Result 6) are done. Remaining follow-ups:
+CoT supervision (Result 5), its airtight randomized-depth version (Result 6), the free-running
+leak check (Result 6), and the hop-curriculum to 6 hops (Result 7) are done. Remaining:
 
-1. **3-hop CoT chains.** With depth-matched training, does the minimum compute grow
-   with hop count (~n applies for n hops)? The honest, mismatch-free counting rule.
-2. **Internalise the scratchpad.** Can the model chain without the explicit
-   intermediate token (latent/implicit CoT), keeping composition?
+1. **Internalise the scratchpad** (the open frontier). Can the model chain without the explicit
+   intermediate token — latent/implicit CoT, reasoning carried in the recurrent state across
+   loops instead of on the token tape? This is the loop-count-bound regime and the most
+   Ember-relevant (reasoning below the token layer). Likely approach: train with CoT then wean
+   off the intermediate token, or an auxiliary latent loss.
+2. **Push the hop-curriculum higher** (--hops 8/10/12) to find where 0.99^N erosion or a genuine
+   wall actually bites; and vary K / d_model to see what sets the ceiling.
 
 Reproduce: `experiments/diag_2hop.py` (see `--cot --typed-mid --distinct-vals
 --derange --swap` flags, and `--mix-hop1` for the pre-CoT curriculum); arms in
