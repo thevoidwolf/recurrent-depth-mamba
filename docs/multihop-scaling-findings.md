@@ -149,13 +149,53 @@ argues for genuine sequential depth, not uniform mismatch; and eval is teacher-f
 on the mid, though mid accuracy ≈ 1.0 at r≥4 so a free-running scratchpad would chain
 the same. Both are named as follow-ups below.
 
+## Result 6 — the airtight test (randomized-depth CoT): most of Result 5's ramp was train/test mismatch
+
+Result 5 trained at fixed r=8, so its r-sweep conflates two things: genuine
+compute-insufficiency at low r, and the fact that a fixed-depth model simply cannot
+operate below its trained depth. To separate them, retrain the CoT task with the
+per-step depth sampled from [1,8] (`--cot --random-depth --rd-range 1 8`, run9) — now
+every test-time r is in-distribution.
+
+**Chain accuracy vs test-time r — fixed-depth (Result 5) vs randomized-depth (this):**
+
+| r | 1 | 2 | 3 | 4 | 6 | 8 | 12 | 16 |
+|---|-----|-----|-----|-----|-----|-----|-----|-----|
+| fixed r=8 (run8) | 0.00 | 0.01 | 0.05 | 0.29 | 0.93 | 0.99 | 0.91 | 0.87 |
+| random [1,8] (run9) | **0.46** | **0.97** | 0.99 | 0.99 | 0.99 | 1.00 | 0.99 | 0.99 |
+
+With depth-matched training the model solves the 2-hop chain at essentially every
+r ≥ 2, and even 0.46 at r=1. So most of Result 5's dramatic 0 → 0.99 ramp was the
+fixed-depth model being unable to run shallow, **not** a real per-loop reasoning
+requirement — the same "randomized-depth buys robustness, not scaling" lesson as
+Result 1, now for composition. Tellingly, hop-1 (mid) is 0.999 at r=1 under
+randomized-depth vs 0.23 under fixed-depth: the apparent "hop-1 needs ~3 loops" was
+pure mismatch.
+
+**The genuine residual:** chain 0.46 (r=1) → 0.97 (r=2), flat after. One apply does
+hop-1 and ~half of hop-2; two applies do both reliably. So the true minimum compute
+for a 2-hop chain is ~2 applies (≈ one loop per hop) — a real but *modest* effect,
+the honest magnitude of the counting rule once the mismatch is removed. Randomized-depth
+training also gives clean depth-robustness (flat 0.99 out to r=16, no collapse).
+
+**Leak check (free-running eval).** Re-scoring run9's checkpoint with the model
+generating its *own* mid — build the prefix up to the A token (the true mid and value
+are never in the input), generate the mid, append the model's own mid, then generate the
+value from it — reproduces the teacher-forced numbers at every r (chain: r1≈0.43, r2≈0.98,
+r≥3≈0.99; free-running vs teacher-forced differ by ≤0.03, free-running occasionally higher).
+So the teacher-forced result was not leaking: the model genuinely chains on its own
+scratchpad, not on a supplied intermediate.
+
 ## Conclusions
 
-1. **Multi-hop reasoning depth scales with test-time loops (the headline).** With
-   intermediate (CoT) supervision, 2-hop chain accuracy rises 0.00 → 0.99 as `r`
-   goes 1 → 8, and the two hops resolve at *different* depths (hop-1 by r≈3, hop-2 by
-   r≈6–8) — the counting-rule signature. Test-time compute buys genuine composition,
-   not just retrieval.
+1. **CoT supervision unlocks composition, which then has a genuine but MODEST
+   test-time-depth requirement (~2 applies for 2 hops).** Under *depth-matched*
+   (randomized-depth) training the CoT model solves the 2-hop chain robustly for all
+   r ≥ 2 (chain 0.46 at r=1 → 0.97 at r=2, flat/robust to r=16). The dramatic
+   0 → 0.99 ramp seen under *fixed-depth* training (Result 5) was largely train/test
+   mismatch, not a per-loop reasoning cost — the same robustness-not-scaling lesson as
+   Result 1. The honest counting-rule signal is small: the extra hop wants ~one extra
+   apply. (Beware fixed-depth r-sweeps: they overstate scaling.)
 2. **The plain 2-hop objective cannot learn it** — no gradient toward the
    intermediate, so the model settles into a keyless bag-of-values. Supervising the
    intermediate (a scratchpad that rewards it) unlocks composition; capacity was
@@ -177,17 +217,13 @@ is retrieval iteration, not reasoning-hop scaling; do not over-read it.
 
 ## Next experiments (rank order)
 
-CoT supervision (was #1 here) is done — Result 5. Follow-ups to harden and extend it:
+CoT supervision (Result 5), its airtight randomized-depth version (Result 6), and the
+free-running leak check (in Result 6) are done. Remaining follow-ups:
 
-1. **Randomized-depth training on the CoT task** (r∈[1,8]). Removes the fixed-depth
-   train/test-mismatch confound; the cleanest claim that low-`r` failure is
-   compute-insufficiency rather than train/test skew.
-2. **Free-running (generated-scratchpad) eval.** Let the model emit its own mid and
-   condition hop-2 on it, confirming the chain doesn't lean on the teacher-forced mid.
-3. **3-hop CoT chains.** Does chain accuracy resolve at hop-1 < hop-2 < hop-3 depths —
-   the counting rule at n=3?
-4. **Internalise the scratchpad.** Can the model chain without the explicit
-   intermediate token (latent/implicit CoT), keeping the depth-scaling?
+1. **3-hop CoT chains.** With depth-matched training, does the minimum compute grow
+   with hop count (~n applies for n hops)? The honest, mismatch-free counting rule.
+2. **Internalise the scratchpad.** Can the model chain without the explicit
+   intermediate token (latent/implicit CoT), keeping composition?
 
 Reproduce: `experiments/diag_2hop.py` (see `--cot --typed-mid --distinct-vals
 --derange --swap` flags, and `--mix-hop1` for the pre-CoT curriculum); arms in

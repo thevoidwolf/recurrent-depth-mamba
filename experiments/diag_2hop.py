@@ -245,6 +245,35 @@ def cot_eval(r, gen, n_batches=2, batch=512):
     return {"cot_mid_acc": mid_c / n, "cot_val_acc": val_c / n, "cot_chain_acc": both_c / n}
 
 
+@torch.no_grad()
+def free_run_eval(r, gen, n_batches=2, batch=512):
+    """Leak-free free-running 2-hop eval. Build the prefix up to (and including) the A
+    token — so the model never sees the true mid OR the true value — let it GENERATE the
+    mid, append the model's OWN mid, then let it generate the value from that. Score
+    against ground truth (used only for comparison, never fed in). fr_chain ≈ teacher-forced
+    cot_chain => the teacher-forced number was not leaking."""
+    model.eval()
+    n = mid_c = val_c = both_c = 0
+    for _ in range(n_batches):
+        raw = sample_raw(batch, gen)
+        ents, mids, vals, perm, t = raw                       # CPU ground truth
+        ar = torch.arange(batch)
+        m_true = mids[ar, perm[ar, t]].to(device)
+        v_true = vals[ar, perm[ar, t]].to(device)
+        seq_full, ans_pos = pack(*raw, cot=True)              # [... Q e_t A m v EOS]
+        seq_full = seq_full.to(device)
+        a_pos = ans_pos - 2                                   # the A (ATOK) position
+        prefix = seq_full[:, :a_pos + 1]                      # [... Q e_t A]  (no mid, no value)
+        m_hat = model(prefix, applies=r)[:, -1].float().argmax(-1)         # generate the mid
+        seq2 = torch.cat([prefix, m_hat.unsqueeze(1)], dim=1)              # append the model's OWN mid
+        v_hat = model(seq2, applies=r)[:, -1].float().argmax(-1)           # generate the value from it
+        mc = m_hat == m_true; vc = v_hat == v_true
+        mid_c += mc.sum().item(); val_c += vc.sum().item(); both_c += (mc & vc).sum().item()
+        n += batch
+    model.train()
+    return {"fr_mid_acc": mid_c / n, "fr_val_acc": val_c / n, "fr_chain_acc": both_c / n}
+
+
 def fmt(o):
     return (f"acc={o['correct']:.3f} own(v_t)={o['own']:.3f} rev={o['rev']:.3f} otherPresent={o['other_present']:.3f} "
             f"absentVal={o['absent_value']:.3f} mid={o['mid_tok']:.3f} ent={o['entity']:.3f} ctrl={o['control']:.3f} | "
@@ -305,6 +334,8 @@ for r in args.depth_eval:
     if args.cot:
         ce = cot_eval(r, eval_gen); final[r].update(ce)
         print(f"       COT (teacher-forced): mid={ce['cot_mid_acc']:.3f} val={ce['cot_val_acc']:.3f} chain={ce['cot_chain_acc']:.3f}")
+        fr = free_run_eval(r, eval_gen); final[r].update(fr)
+        print(f"       FREE-RUN (generated mid, leak-free): mid={fr['fr_mid_acc']:.3f} val={fr['fr_val_acc']:.3f} chain={fr['fr_chain_acc']:.3f}")
     print(f"       bank-2 slot histogram of predictions (slot 0 = earliest .. {K-1} = latest): "
           + " ".join(f"{p:.2f}" for p in o["pos_hist"]))
 if args.out:
