@@ -65,9 +65,13 @@ ap.add_argument("--finetune", action="store_true",
 ap.add_argument("--wean", action="store_true", help="soft-wean CoT -> pause tokens at a fixed depth")
 ap.add_argument("--wean-depth", type=int, default=0, help="fixed depth to wean at (0 = use --hops); "
                 "set < --hops to wean a shallow chain while keeping the vocab of a deeper warm-start ckpt")
-ap.add_argument("--wean-mode", choices=["row", "hop"], default="row",
+ap.add_argument("--wean-mode", choices=["row", "hop", "mixed"], default="row",
                 help="'row': ramp the FRACTION of fully-internal rows (good for shallow depth); "
-                     "'hop': ramp wean_k, internalising one trailing hop at a time (eases deeper chains in)")
+                     "'hop': ramp wean_k, internalising one trailing hop at a time (deterministic; the "
+                     "deepest level gets ALL late steps -> can catastrophically forget shallower chains); "
+                     "'mixed': like 'hop' but each step REPLAYS a shallower wean_k half the time "
+                     "(50% at the current deepest kmax, 50% uniform over 0..kmax-1), so the shallower "
+                     "in-state chain is retained while the next hop is introduced")
 ap.add_argument("--wean-start", type=int, default=2000, help="steps of full CoT before weaning begins")
 ap.add_argument("--wean-steps", type=int, default=14000, help="steps to ramp the wean 0 -> fully internal")
 args = ap.parse_args()
@@ -253,14 +257,20 @@ if (not args.load) or args.finetune:
             r = int(torch.randint(args.rd_range[0], args.rd_range[1] + 1, (1,), generator=depth_gen).item()) \
                 if args.random_depth else None
             raw = sample_raw(args.batch, train_gen, WD)
-            if args.wean_mode == "hop":
-                # internalise one trailing hop at a time: wean_k ramps 0 -> WD-1 (deterministic)
-                wean_k = round(p * (WD - 1))
+            if args.wean_mode in ("hop", "mixed"):
+                # internalise one trailing hop at a time. 'hop': wean_k = kmax (deterministic ramp).
+                # 'mixed': kmax ramps too, but each step replays a shallower wean_k half the time so
+                # the already-internalised shallower chain is not forgotten while kmax advances.
+                kmax = round(p * (WD - 1))
+                if args.wean_mode == "hop" or kmax == 0 or torch.rand(1, generator=depth_gen).item() < 0.5:
+                    wean_k = kmax
+                else:
+                    wean_k = int(torch.randint(0, kmax, (1,), generator=depth_gen).item())  # replay 0..kmax-1
                 seq, ans_pos = pack(*raw, h=WD, cot=True, wean_k=wean_k); seq = seq.to(device)
                 logits = model(seq, applies=r)
                 positions = [ans_pos - WD + j for j in range(WD - 1 - wean_k)] + [ans_pos - 1]
                 loss = sum(F.cross_entropy(logits[:, pp], seq[:, pp + 1]) for pp in positions) / len(positions)
-                prog = f"wean_k={wean_k}/{WD-1}"
+                prog = f"wean_k={wean_k}/{kmax}" + ("(mix)" if args.wean_mode == "mixed" else f"/{WD-1}")
             else:
                 # ramp the FRACTION of rows that are fully-internal; rest are full CoT
                 internal_mask = torch.rand(args.batch, generator=depth_gen) < p
