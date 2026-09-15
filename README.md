@@ -19,8 +19,7 @@ is the technical version.
 
 A second set of experiments (["does thinking longer buy reasoning?"](#a-different-question-does-thinking-longer-buy-reasoning),
 further down) asks a different question of the same looped model. Because it reuses
-one block, at test time you can run that block *more times than it was trained with*
-— it can "think longer." Does that extra thinking let it solve harder problems? The
+one block, at test time you can run that block *more times than it was trained with*, so it can "think longer." Does that extra thinking let it solve harder problems? The
 short answer: it can be taught real multi-step reasoning, but most of that reasoning
 has to be **written down** as it goes; the amount it can do purely "in its head" is
 real but shallow.
@@ -161,21 +160,21 @@ than bury.
 
 ## A different question: does thinking longer buy reasoning?
 
-Everything above is about *parameters* — can you shrink the model. A looped model has
+Everything above is about *parameters*: can you shrink the model. A looped model has
 a second knob the baseline does not: at test time you can run the shared block **more
 times than it was trained with**. It can "think longer." The obvious question is
 whether thinking longer lets it solve *harder* problems, or whether it just tolerates
 the extra loops.
 
 To answer that you need a task that actually gets harder with more reasoning. A
-one-fact lookup does not — it is one step no matter what. So this second set of
+one-fact lookup does not: it is one step no matter what. So this second set of
 experiments moves to **multi-hop chains**: instead of "X's value is 5", the model
 gets a chain like "X points to Y, Y points to Z, Z's value is 5" and has to follow
 it. A 2-hop chain needs two steps; a 6-hop chain needs six. Now "more reasoning"
 means something measurable.
 
 *(Every plot below is read straight from the run outputs. The fully technical
-write-up — every number, control, and caveat — is in
+write-up, every number, control, and caveat, is in
 [`docs/multihop-scaling-findings.md`](docs/multihop-scaling-findings.md).)*
 
 ### Thinking longer, or just tolerating it?
@@ -185,20 +184,20 @@ fixed depth and then test it at other depths, you get a beautiful curve: accurac
 climbs steeply as you add loops. It looks like "more thinking → more reasoning."
 
 It is mostly an illusion. A model trained only at 8 loops does not know how to run at
-1 or 2 loops — the low end fails from unfamiliarity, not from a lack of computation.
+1 or 2 loops; the low end fails from unfamiliarity, not from a lack of computation.
 Train the *same* model across a range of depths and the curve mostly flattens: the
 2-hop task needs only about two loops, and the dramatic ramp was train/test mismatch.
 
 ![Fixed-depth vs depth-matched training on a two-hop chain](docs/figs/fig1_depth_matched.png)
 
 The lesson (which I got wrong once and had to walk back): **a rising
-accuracy-vs-loops curve from a fixed-depth model overstates real scaling — always
+accuracy-vs-loops curve from a fixed-depth model overstates real scaling; always
 confirm with a model trained across depths.**
 
 ### Multi-hop reasoning is surprisingly hard to *learn*
 
 Getting a small model to follow even a 2-hop chain is harder than it sounds. Trained
-naively — just show it the chain and ask for the final answer — it never learns. It
+naively (just show it the chain and ask for the final answer), it never learns. It
 settles into a shortcut: guess *some* value that appears in the problem, which is
 right often enough to lower the loss but is not reasoning. The reason is subtle:
 predicting only the final answer gives the model no signal about the **middle** step,
@@ -206,51 +205,50 @@ so it never builds one.
 
 The fix is the same one that works for large models: let it **write its work down**.
 When the model is trained to emit the intermediate step ("…so the middle thing is
-Y…") before the final answer — a scratchpad, or "chain of thought" — it learns the
+Y…") before the final answer (a scratchpad, or "chain of thought"), it learns the
 chain cleanly. The written intermediate is what finally gives the middle of the chain
 something to learn from.
 
 A side result worth noting: giving each hop its *own* dedicated block is **worse**
-than reusing one shared block for all of them — on both robustness and on actually
+than reusing one shared block for all of them, on both robustness and on actually
 learning the composition. Sharing wins here, which is the whole spirit of the repo.
 
 ### With a scratchpad, it reaches six-hop chains
 
 Once the scratchpad is in place, how deep can it go? Trained cold on a 3-hop chain it
-still stalls — the hops have to be learned one after another, and three at once is too
-much. But trained as a **curriculum** — master 1 hop, then 2, then 3, each building on
-the last — it climbs smoothly to **six-hop chains** with no wall in sight, and each
+still stalls: the hops have to be learned one after another, and three at once is too
+much. But trained as a **curriculum** (master 1 hop, then 2, then 3, each building on
+the last), it climbs smoothly to **six-hop chains** with no wall in sight, and each
 new hop is learned faster than the one before.
 
 ![A curriculum reaches six-hop chains](docs/figs/fig2_curriculum.png)
 
 Accuracy drifts down gently with length (each hop is about 99% right, and six of them
 compound to ~95%), but there is no cliff. The catch: with a scratchpad the reasoning
-happens **on the page** — each step is a written token — so running more *internal*
+happens **on the page** (each step is a written token), so running more *internal*
 loops is not what is doing the work. Depth here is bought by writing more steps,
 cheaply.
 
-### Reasoning "in its head" — and where it hits a wall
+### Reasoning "in its head", and where it hits a wall
 
 The more interesting question for a small model is whether it can do the chain
-*without* writing every step — carrying the intermediate in its internal state across
+*without* writing every step, carrying the intermediate in its internal state across
 the loops, the way you might add two numbers in your head. This is where the extra
 loops should finally matter.
 
 To get there I **weaned** the model off the scratchpad: start with the written steps,
 then gradually replace each one with a blank "think" token that carries no
 information but still gives the model a step in which to compute. Done gradually, it
-works for a 2-hop chain — the model solves it entirely in its internal state.
+works for a 2-hop chain: the model solves it entirely in its internal state.
 
 And now the extra loops genuinely matter. With the step no longer written down, the
 2-hop chain **needs at least two loops**: one loop fails (stuck at the shortcut
-floor), two loops solve it. This is the real "thinking longer buys reasoning" result
-— and it only appears once the reasoning is internal.
+floor), two loops solve it. This is the real "thinking longer buys reasoning" result, and it only appears once the reasoning is internal.
 
 ![Internal reasoning is loop-bound: two hops need at least two loops](docs/figs/fig3_loop_bound.png)
 
 But internal reasoning is **shallow**. The 2-hop chain goes fully into the model's
-state; a 3-hop chain does not — the last two steps internalise, but the third refuses
+state; a 3-hop chain does not: the last two steps internalise, but the third refuses
 to, and the available loops do not fix it (it is a learning/capacity limit, not a
 loop shortage). So there is a sharp split between reasoning on the page and reasoning
 in the head:
@@ -265,12 +263,12 @@ and the internal version is genuine but shallow.
 
 ### What the second half adds up to
 
-- Thinking longer on an *easy* task only buys **robustness** — the model tolerates
+- Thinking longer on an *easy* task only buys **robustness**: the model tolerates
   extra loops without new ability.
 - It can be taught genuine multi-hop reasoning, but only if it **writes its work
   down**, and best via a **curriculum**, which reaches six-hop chains.
 - It can also learn to reason **internally**, with no written steps, and there the
-  extra loops finally pay off (a 2-hop chain provably needs ≥2 loops) — but internal
+  extra loops finally pay off (a 2-hop chain provably needs ≥2 loops), but internal
   reasoning is **shallow** (~2 steps) where the written kind goes far deeper.
 - Repeat of the methodological caution: fixed-depth test-time-scaling curves flatter
   themselves; confirm with depth-matched training, and prefer leak-free evaluation.
