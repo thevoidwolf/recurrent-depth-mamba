@@ -21,11 +21,11 @@ A second set of experiments (["does thinking longer buy reasoning?"](#a-differen
 further down) asks a different question of the same looped model. Because it reuses
 one block, at test time you can run that block *more times than it was trained with*, so it can "think longer." Does that extra thinking let it solve harder problems? The
 short answer: it can be taught real multi-step reasoning. Written down step by step it
-reaches at least six steps; done **in its head** — no written steps — each step costs
+reaches at least six steps; done **in its head** (no written steps) each step costs
 one extra "thinking" loop, so an *N*-step chain needs *N* loops, and the intermediate
 results turn out to be stashed one-per-position inside the model. (An earlier version of
 this page reported in-head reasoning topping out at ~2 steps; that was a training-schedule
-bug, now fixed — it internalises a 3-step chain cleanly.)
+bug, now fixed; it internalises a 3-step chain cleanly.)
 
 ## What "recurrent depth" means
 
@@ -252,37 +252,37 @@ and it only appears once the reasoning is internal.
 ![Internal reasoning is loop-bound: two hops need at least two loops](docs/figs/fig3_loop_bound.png)
 
 **A false wall, and what fixing it revealed.** A 3-hop chain at first refused to go
-internal, which looked like a hard ceiling at ~2 steps. It was not — it was a bug in
+internal, which looked like a hard ceiling at ~2 steps. It was not: it was a bug in
 *how* I weaned. The schedule pushed all the way to the hardest (fully-internal) version
 and stopped rehearsing the easier ones, so the model quietly *forgot* the scaffolding
 it had already built and collapsed back to guessing. Rehearsing the shallower versions
 alongside the deep one (a "replay" schedule) fixes it, and the 3-hop chain internalises
-cleanly — high accuracy, with the written-out version still intact. A comparison at the
+cleanly, at high accuracy, with the written-out version still intact. A comparison at the
 *same* training budget confirms it is the schedule, not the amount of training.
 
 **How it does it: one "register" per step.** Once it works, you can look inside and see
 the trick. Each step's result is stashed in the model's state **at its own think-token
-position** — step 1's answer at the first slot, step 2's at the next — written *once*
+position** (step 1's answer at the first slot, step 2's at the next), written *once*
 and then held. You can prove this is what it's using (not a coincidence) by overwriting
 one position's contents with those computed for a *different* question: the model's final
 answer switches to that other question's, exactly. And "written once and held" is why
 running extra loops past what's needed does no harm. Each new step also costs one more
-loop, so an *N*-step chain needs *N* loops — the left panel below.
+loop, so an *N*-step chain needs *N* loops (the left panel below).
 
 ![Internal reasoning uses one register per step, and needs one loop per step](docs/figs/fig5_registers.png)
 
 **So how far does in-head reasoning go?** At least three steps (as far as I pushed it),
-with no wall in sight — the earlier "~2" was the weaning bug, not a limit.
+with no wall in sight; the earlier "~2" was the weaning bug, not a limit.
 
 ![Reasoning reaches at least six steps on the page, three so far in the head](docs/figs/fig4_ceiling.png)
 
 **The honest catch: "in its head" is not free.** It still spends one think-token position
-per step — the *content* is hidden, but the step is still there on the page as a blank
+per step: the *content* is hidden, but the step is still there on the page as a blank
 slot. So internal reasoning is really *silent* chain-of-thought: the same steps laid out
 in sequence, just not spelled out, and it costs *more* compute than writing them out (each
 step now also needs its own loop). What you gain is that the reasoning is not exposed as
 text and lives in continuous rather than discrete form; what you do not gain is a shortcut
-around doing the work — so the thing that buys *deep* reasoning cheaply is still the
+around doing the work, so the thing that buys *deep* reasoning cheaply is still the
 written scratchpad.
 
 ### What the second half adds up to
@@ -296,7 +296,7 @@ written scratchpad.
   3 → ≥3), with each step's result stashed in its own hidden "register" (verified by
   overwriting one and watching the answer change). It reaches at least 3 steps in the
   head; an earlier "~2" ceiling was a weaning bug, not a limit. The catch: this is
-  *silent* chain-of-thought — still one position per step — so it costs *more* compute
+  *silent* chain-of-thought (still one position per step), so it costs *more* compute
   than writing the steps out, not less.
 - Repeat of the methodological caution: fixed-depth test-time-scaling curves flatter
   themselves; confirm with depth-matched training, and prefer leak-free evaluation.
