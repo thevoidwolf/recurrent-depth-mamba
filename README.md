@@ -20,9 +20,12 @@ is the technical version.
 A second set of experiments (["does thinking longer buy reasoning?"](#a-different-question-does-thinking-longer-buy-reasoning),
 further down) asks a different question of the same looped model. Because it reuses
 one block, at test time you can run that block *more times than it was trained with*, so it can "think longer." Does that extra thinking let it solve harder problems? The
-short answer: it can be taught real multi-step reasoning, but most of that reasoning
-has to be **written down** as it goes; the amount it can do purely "in its head" is
-real but shallow.
+short answer: it can be taught real multi-step reasoning. Written down step by step it
+reaches at least six steps; done **in its head** — no written steps — each step costs
+one extra "thinking" loop, so an *N*-step chain needs *N* loops, and the intermediate
+results turn out to be stashed one-per-position inside the model. (An earlier version of
+this page reported in-head reasoning topping out at ~2 steps; that was a training-schedule
+bug, now fixed — it internalises a 3-step chain cleanly.)
 
 ## What "recurrent depth" means
 
@@ -229,37 +232,58 @@ happens **on the page** (each step is a written token), so running more *interna
 loops is not what is doing the work. Depth here is bought by writing more steps,
 cheaply.
 
-### Reasoning "in its head", and where it hits a wall
+### Reasoning "in its head": how it works, and how far it goes
 
 The more interesting question for a small model is whether it can do the chain
-*without* writing every step, carrying the intermediate in its internal state across
-the loops, the way you might add two numbers in your head. This is where the extra
-loops should finally matter.
+*without* writing every step, carrying the intermediates inside itself across the
+loops, the way you might add two numbers in your head. This is where the extra loops
+should finally matter.
 
 To get there I **weaned** the model off the scratchpad: start with the written steps,
 then gradually replace each one with a blank "think" token that carries no
 information but still gives the model a step in which to compute. Done gradually, it
-works for a 2-hop chain: the model solves it entirely in its internal state.
+works for a 2-hop chain: the model solves it entirely internally.
 
 And now the extra loops genuinely matter. With the step no longer written down, the
 2-hop chain **needs at least two loops**: one loop fails (stuck at the shortcut
-floor), two loops solve it. This is the real "thinking longer buys reasoning" result, and it only appears once the reasoning is internal.
+floor), two loops solve it. This is the real "thinking longer buys reasoning" result,
+and it only appears once the reasoning is internal.
 
 ![Internal reasoning is loop-bound: two hops need at least two loops](docs/figs/fig3_loop_bound.png)
 
-But internal reasoning is **shallow**. The 2-hop chain goes fully into the model's
-state; a 3-hop chain does not: the last two steps internalise, but the third refuses
-to, and the available loops do not fix it (it is a learning/capacity limit, not a
-loop shortage). So there is a sharp split between reasoning on the page and reasoning
-in the head:
+**A false wall, and what fixing it revealed.** A 3-hop chain at first refused to go
+internal, which looked like a hard ceiling at ~2 steps. It was not — it was a bug in
+*how* I weaned. The schedule pushed all the way to the hardest (fully-internal) version
+and stopped rehearsing the easier ones, so the model quietly *forgot* the scaffolding
+it had already built and collapsed back to guessing. Rehearsing the shallower versions
+alongside the deep one (a "replay" schedule) fixes it, and the 3-hop chain internalises
+cleanly — high accuracy, with the written-out version still intact. A comparison at the
+*same* training budget confirms it is the schedule, not the amount of training.
 
-![Reasoning reaches further on the page than in the model's head](docs/figs/fig4_ceiling.png)
+**How it does it: one "register" per step.** Once it works, you can look inside and see
+the trick. Each step's result is stashed in the model's state **at its own think-token
+position** — step 1's answer at the first slot, step 2's at the next — written *once*
+and then held. You can prove this is what it's using (not a coincidence) by overwriting
+one position's contents with those computed for a *different* question: the model's final
+answer switches to that other question's, exactly. And "written once and held" is why
+running extra loops past what's needed does no harm. Each new step also costs one more
+loop, so an *N*-step chain needs *N* loops — the left panel below.
 
-**With a scratchpad the model reaches at least six reasoning steps; in its head it
-tops out around two.** Whether that ceiling is fundamental or just needs a wider
-internal state and more training is the open question. Either way the takeaway is
-clean: writing the steps down is what buys deep reasoning in a small looped model,
-and the internal version is genuine but shallow.
+![Internal reasoning uses one register per step, and needs one loop per step](docs/figs/fig5_registers.png)
+
+**So how far does in-head reasoning go?** At least three steps (as far as I pushed it),
+with no wall in sight — the earlier "~2" was the weaning bug, not a limit.
+
+![Reasoning reaches at least six steps on the page, three so far in the head](docs/figs/fig4_ceiling.png)
+
+**The honest catch: "in its head" is not free.** It still spends one think-token position
+per step — the *content* is hidden, but the step is still there on the page as a blank
+slot. So internal reasoning is really *silent* chain-of-thought: the same steps laid out
+in sequence, just not spelled out, and it costs *more* compute than writing them out (each
+step now also needs its own loop). What you gain is that the reasoning is not exposed as
+text and lives in continuous rather than discrete form; what you do not gain is a shortcut
+around doing the work — so the thing that buys *deep* reasoning cheaply is still the
+written scratchpad.
 
 ### What the second half adds up to
 
@@ -268,8 +292,12 @@ and the internal version is genuine but shallow.
 - It can be taught genuine multi-hop reasoning, but only if it **writes its work
   down**, and best via a **curriculum**, which reaches six-hop chains.
 - It can also learn to reason **internally**, with no written steps, and there the
-  extra loops finally pay off (a 2-hop chain provably needs ≥2 loops), but internal
-  reasoning is **shallow** (~2 steps) where the written kind goes far deeper.
+  extra loops finally pay off: an *N*-step chain needs *N* loops (2 steps → ≥2 loops,
+  3 → ≥3), with each step's result stashed in its own hidden "register" (verified by
+  overwriting one and watching the answer change). It reaches at least 3 steps in the
+  head; an earlier "~2" ceiling was a weaning bug, not a limit. The catch: this is
+  *silent* chain-of-thought — still one position per step — so it costs *more* compute
+  than writing the steps out, not less.
 - Repeat of the methodological caution: fixed-depth test-time-scaling curves flatter
   themselves; confirm with depth-matched training, and prefer leak-free evaluation.
 
@@ -305,7 +333,11 @@ python experiments/02_long_depth_sweep.py --full     # 3 arms x 5 seeds, ~3 hour
 python experiments/03_test_time_depth.py --ab --arm rd_1x4 --task long   # robustness vs scaling
 python experiments/diag_2hop.py --cot --typed-mid --distinct-vals --derange --swap  # two-hop with a scratchpad
 python experiments/diag_nhop.py --curriculum --hops 6 --random-depth     # curriculum to six-hop chains
-python experiments/diag_nhop.py --wean --hops 2 --random-depth           # internalise the scratchpad
+python experiments/diag_nhop.py --wean --hops 2 --random-depth           # internalise the scratchpad (2-hop)
+python experiments/diag_nhop.py --wean --wean-mode mixed --wean-depth 3 --hops 6 \
+    --load results/run12_curriculum.pt --finetune --random-depth         # internalise a 3-hop chain (replay wean)
+python experiments/probe_instate.py --load results/run16_wean3_mixed.pt --hops 3   # read out the registers
+python experiments/patch_registers.py --load results/run16_wean3_mixed.pt --hops 3 # causal check
 ```
 
 Each run writes a JSON into `results/` with the full accuracy curve; the tables and
@@ -327,9 +359,11 @@ experiments/
   03_test_time_depth.py      test-time depth: robustness vs scaling
   04_multihop_scaling.py     multi-hop chains, favorable vs adversarial layouts
   diag_2hop.py               instrumented two-hop study (scratchpad, leak-free evals)
-  diag_nhop.py               general N-hop: curriculum + scratchpad internalisation
+  diag_nhop.py               general N-hop: curriculum + scratchpad internalisation (soft-weaning, incl. replay)
+  probe_instate.py           linear-decode each hop's result from the state, by position and loop
+  patch_registers.py         causal activation-patching check of the position registers
 docs/
-  multihop-scaling-findings.md   the full technical write-up (all nine results)
+  multihop-scaling-findings.md   the full technical write-up (all ten results)
   figs/                          the figures used in this README
   make_figs.py                   regenerates the figures from results/
 results/          per-run JSON output (git-ignored; regenerated by the sweeps)

@@ -18,17 +18,24 @@ The arc, and what each step actually established (numbers are chain accuracy unl
 4. **Weight-sharing beats per-hop blocks** on both depth-robustness and composition (Result 4).
 5. **A hop-curriculum reaches ≥6-hop chains with no wall** (cold-start can't do 3). But with CoT the
    depth lives on the **token tape** — per-lookup compute is ~constant in chain length (Result 7).
-6. **The core genuinely internalises reasoning — but only shallowly.** Soft-weaning (CoT → content-free
-   pause tokens, gradually) puts a **2-hop** chain fully in the recurrent state (value 0.99), and there
-   it is **loop-bound**: r=1 fails (0.06), r=2 works (0.97) — real in-core "loops buy reasoning depth"
-   (Result 8). **3-hop does not fully internalise** here (the last 2 hops do; the 3rd stalls) — in-state
-   reasoning tops out ~2 hops while externalised CoT reaches ≥6 (Result 9).
+6. **The core internalises reasoning via soft-weaning, and it is LOOP-BOUND.** Replacing CoT tokens
+   with content-free pause tokens (gradually) puts a **2-hop** chain in-state at value 0.99, needing
+   **≥2 loops** (r=1: 0.06, r=2: 0.97) — real in-core "loops buy reasoning depth" (Result 8).
+7. **An apparent "~2-hop cap" was a weaning-schedule artifact; the mechanism is a per-position register
+   (Result 10).** A probe shows the stalled 3-hop model computed *nothing* in-state (schedule with no
+   replay had destroyed its own scaffold). A **replaying** wean internalises 3-hop fully (0.99, CoT
+   retained); an equal-budget ablation shows replay — not budget — is the cause. Each hop's result is
+   held **write-once at its own pause-token position** (causally verified by donor-swap and single-loop
+   patching), and **N loops ≈ N hops** (2-hop needs r≥2, 3-hop r≥3). So "in-state" reasoning is
+   **latent pause-token CoT** (O(N) positions, content latent), not scratchpad-free — costing ~N/2× CoT.
 
-**Bottom line:** a looped SSM core can reason multi-hop *below the token layer*, but only *shallowly*
-(≈2 hops in-state here); deep chains are bought by an **external scratchpad** (chain-of-thought tokens),
-not by loops alone — so the in-state depth ceiling (bigger `d_state`/`d_model`, finer weaning) is the
-thing to push. Method lesson banked: **fixed-depth r-sweeps overstate scaling — always confirm with
-randomized-depth**, and prefer leak-free (free-running) evals.
+**Bottom line:** a looped SSM core reasons multi-hop *below the token layer* by writing each hop's
+result into a **content-free pause-token position** (a residual-stream register) and holding it across
+loops; loop count gates hop count (**N loops ≈ N hops**). The apparent shallow ceiling was a weaning
+artifact (fixed by replaying shallower depths), not a capacity limit — and this is *latent CoT*, still
+O(N) tape positions, not reasoning for free. Method lessons banked: **fixed-depth r-sweeps overstate
+scaling — always confirm with randomized-depth**; prefer leak-free (free-running) evals; and **verify
+an internalisation "ceiling" against forgetting before calling it capacity.**
 
 ## Question
 
@@ -266,10 +273,21 @@ budget, not a capability limit.
 r=1 (one loop) fails at bag-of-values; r=2 (two loops) solves it → the internalised 2-hop chain
 needs **≥2 loops ≈ one loop per hop**. This is "loops buy reasoning depth" in the pure sense, and
 the key contrast with Result 7: with CoT the depth lives on the **token tape** (~2 applies
-regardless of chain length, one lookup per token position); internalised, the whole chain resolves
-in the **recurrent state**, so loop count directly gates hop count.
+regardless of chain length, one lookup per token position); internalised, loop count directly gates
+hop count.
 
-## Result 9 — internalisation has a shallow in-state depth limit (~2 hops here)
+> **Wording note (see Result 10).** "The whole chain resolves in the recurrent state" is imprecise:
+> Result 10's probe shows each intermediate is held in the **residual stream at its own pause-token
+> position** (a positional register), not co-located in the SSM hidden state. So this is *latent
+> pause-token CoT* — one thinking position per hop, content latent — with the loops supplying the
+> per-hop compute; it is not scratchpad-free reasoning.
+
+## Result 9 — an APPARENT shallow in-state depth limit (~2 hops) — SUPERSEDED by Result 10
+
+> **Superseded.** The "~2-hop cap" reported here was a **weaning-schedule artifact**, not a
+> capacity limit. With a replaying wean schedule the 3-hop chain internalises fully (0.99) and
+> the mechanism is a per-position register, not a two-intermediate bottleneck. See **Result 10**.
+> The `--wean-mode hop` result below is left as-is for the record.
 
 Does the internalised, loop-bound behaviour scale to 3 hops (would 3-hop-in-state need r≥3)?
 Soft-wean a 3-hop chain, warm-started from the run12 CoT model (`--wean-depth 3` keeps run12's
@@ -291,7 +309,90 @@ the "N hops ≈ N loops" law is **not** established (we couldn't get 3-hop in-st
 
 The real result is the **contrast**: externalised (CoT) reasoning reaches ≥6 hops (Result 7);
 internalised (in-state) reasoning tops out around **2 hops** here. The token scratchpad is what buys
-deep chains.
+deep chains. *(Result 10 overturns the "~2 hops" ceiling: it was this recipe forgetting, not a limit.)*
+
+## Result 10 — the "~2-hop cap" was a weaning artifact; the mechanism is a per-position register
+
+Result 9 left one question — is the ~2-hop in-state ceiling a capacity limit or a training artifact?
+A **mechanistic probe** (`experiments/probe_instate.py`) answers it, and the answer overturns Result 9.
+
+**The probe.** For `rd_1x8` the single core block is looped `r` times, so a forward hook on it
+captures the residual stream after every loop in one forward. We fit a linear probe to decode each
+chain intermediate (m1, m2, …, value) from the residual at each answer-region position, per loop.
+Validated on the solved 2-hop model (run14): m1 is decodable **1.00 at the `A` position**, the value
+**0.99 at the pause**, both building with loops in lock-step with the loop-bound value curve — so
+linear decodability faithfully reads out in-state computation.
+
+**Result 9's stall was catastrophic forgetting, not capacity.** Probing the stalled run15 checkpoint,
+*no* intermediate is decodable anywhere at either wean_k=1 or wean_k=2 (all ≈ chance; value ≈ 0.06) —
+even though wean_k=1 *had* grokked earlier in training. Cause (in `--wean-mode hop`): at wean_k=2 only
+the value position is supervised and shallower wean_k are never replayed, so the scaffold sub-circuits
+(the `A`→m1 writer, the pause reader) lose all gradient, drift, and are destroyed. The ceiling was the
+schedule erasing its own earlier solution.
+
+**The fix — a replaying wean (`--wean-mode mixed`).** Each step: 50% at the current deepest wean_k,
+50% replaying a uniformly-random shallower one, so the shallower chain is reinforced while the next hop
+is introduced. Warm-started from the run12 CoT curriculum, 45k steps (run16). **3-hop internalises
+fully**, and CoT is retained throughout (value@CoT = 1.00 the whole run):
+
+| test-time r | 1 | 2 | 3 | 4 | 6 | 8 | 12 | 16 |
+|---|-----|-----|-----|-----|-----|-----|-----|-----|
+| 3-hop value @ full-internal | 0.05 | 0.05 | **0.84** | 0.98 | 0.99 | 0.99 | 0.98 | 0.94 |
+
+**Equal-budget ablation (run17) isolates the cause.** Same 45k budget, only the schedule differs:
+`hop` (no replay) leaves full-internal at chance (0.06) *and* collapses CoT (1.00 → 0.05); `mixed`
+(replay) gives 0.99 with CoT held at 1.00. Replay is the sole difference — so it is the **schedule**,
+not the budget. (Seed-1 replicates the whole picture: 3-hop → 0.99, same staircase, same register map.)
+
+**The mechanism — one write-once register per token position.** Probing run16 at full-internal, r=8,
+linear-decode accuracy by position (chance ≈ 0.008 over the 128-pool):
+
+| position | m1 | m2 | value |
+|---|---|---|---|
+| query `e_t` | 0.01 | 0.01 | 0.01 |
+| `A` (marker) | **1.00** | 0.01 | 0.01 |
+| PAUSE₁ (`t0`) | 0.09 | **0.99** | 0.01 |
+| PAUSE₂ (`t1`, value predicted here) | 0.02 | 0.18 | **0.99** |
+
+Hop-1's result lives at the `A` position, hop-2's at the first pause, the value at the second — **both
+derived intermediates held simultaneously, at different positions.** So there is no "can't hold two
+partials" bottleneck; capacity is **sidestepped** by using positions as registers, not refuted.
+
+**Causal, not just correlational (`experiments/patch_registers.py`).** For each row, run a *donor*
+query (t′≠t) over the same banks, capture the looped block's output at one position per loop, and
+overwrite that position in the *target* run. Fraction of rows whose predicted value equals the target
+vs the donor chain (r=8): patching `A` flips it to the **donor's** value (target 0.99→0.001, donor
+0.001→0.99); patching the first pause flips it too; patching the query does nothing. And patching `A`
+on **loop 1 only** (loops 2..r run normally) *still* flips the answer — the register is **written once
+and then held** (a fixed point), which is exactly why extra loops past r_min are harmless.
+
+**N loops ≈ N hops.** The value at the answer-forming position appears one loop after its predecessor
+register fills: m1@`A` by r=1, m2@pause by r=2, value by r=3. So the loop count needed = the number of
+in-state hops: 2-hop-in-state solves at r≥2 (Result 8), full 3-hop-in-state at r≥3 (staircase r2 0.05
+→ r3 0.84 → r4 0.98). Because run16 trains at randomized depth [1,8], the staircase is in-distribution,
+**not** the fixed-depth mismatch of Result 6 — a genuine per-hop compute requirement.
+
+**What this actually is, and its cost.** "Internalised" reasoning here is **latent pause-token
+chain-of-thought**: it still spends one tape position per hidden hop (as a content-free PAUSE), only
+the *content* is latent in the residual stream. So it is not scratchpad-free — it is O(N) positions
+*and* r≥N loops, i.e. ~N/2× the compute of explicit CoT (which needs ~1–2 loops per token regardless
+of N, Result 7). The large-N bottleneck is therefore compute and bank interference (~0.99^N, shared
+with CoT), **not** a recurrent-state capacity limit — the partials are positional, so their *number*
+is not bounded by `d_state`. This is consistent with SSMs' fixed-state limits (Merrill et al. 2024)
+pushing sequential reasoning onto token positions rather than the hidden state.
+
+## Concurrent work
+
+The closest work is **Kohli, Parthasarathy, Sun & Yao, "Loop, Think, & Generalize: Implicit Reasoning
+in Recurrent-Depth Transformers" (COLM 2026, arXiv:2604.07822)**, which independently studies a
+recurrent-depth **transformer** on synthetic k-hop chains and reports logit-lens position-decoding,
+activation patching, and loop-count-controls-hop-depth (super-linear depth extrapolation). This study
+differs in substrate (a looped **state-space model**), in method (internalising *explicit CoT* via
+soft-weaning, vs implicit-from-scratch training), in the **write-once / loop-invariance** causal test
+(patching a single loop — not run there), and in the **schedule-artifact + replay** result (Result 10),
+which has no analogue there. Also relevant: the recurrent-depth architecture (Geiping et al. 2025,
+Huginn), stepwise CoT internalisation (Deng et al. 2024), pause/filler tokens (Goyal et al. 2023; Pfau
+et al. 2024), and the SSM state-tracking limit (Merrill et al. 2024).
 
 ## Conclusions
 
@@ -318,16 +419,20 @@ deep chains.
    accelerating per-hop grok), where cold-start couldn't even do 3 (Result 7). With CoT the
    per-lookup test-time compute is ~constant in chain length — depth is externalised to the
    token sequence.
-6. **The core internalises reasoning — but only shallowly (Results 8–9).** Soft-weaning
-   (CoT → content-free pause tokens, gradually) moves a **2-hop** chain fully into the recurrent
-   state (value 0.99), and there it is **loop-bound**: 2-hop needs ≥2 loops (r=1: 0.06, r=2: 0.97) —
-   the genuine in-core "loops buy reasoning depth" (run13's earlier failure was deleting the compute
-   position, not a capability limit). But **3-hop does not fully internalise** with this recipe: the
-   last 2 hops of a 3-chain go in-state, the 3rd stalls (not loop-budget — eval r=8). So in-state
-   reasoning tops out ~2 hops here while externalised CoT reaches ≥6 — **the token scratchpad is what
-   buys depth.** Architecturally: a looped core supports *shallow* in-core reasoning; deeper chains
-   want an external scratchpad. Open: is the ~2-hop in-state ceiling a hard capacity limit or a
-   weaning/steps/d_state artifact?
+6. **The core internalises reasoning via soft-weaning, and it is loop-bound (Result 8).** Replacing
+   CoT tokens with content-free pause tokens moves a **2-hop** chain in-state (value 0.99), needing
+   ≥2 loops (r=1: 0.06, r=2: 0.97) — the genuine in-core "loops buy reasoning depth" (run13's earlier
+   failure was deleting the compute *position*, not a capability limit).
+7. **The mechanism is a per-position write-once register; the apparent depth ceiling was a weaning
+   artifact (Result 10).** Result 9's "~2-hop cap" was **catastrophic forgetting** from a schedule
+   that stops supervising shallower steps (probe: the stalled model computed nothing in-state). A
+   **replaying** wean internalises 3-hop fully (0.99, CoT retained), and an equal-budget ablation
+   pins replay — not budget — as the cause. Each hop's result is held **write-once at its own
+   pause-token position** (causally verified by donor-swap and single-loop patching), giving
+   **N loops ≈ N hops** (2-hop r≥2, 3-hop r≥3). So "in-state" reasoning is **latent pause-token CoT**:
+   O(N) positions with latent content, ~N/2× the compute of explicit CoT — not scratchpad-free, and
+   its large-N bottleneck is compute + bank interference, **not** recurrent-state capacity (partials
+   are positional). Consistent with the fixed-state limit of SSMs (Merrill et al. 2024).
 
 ## Caveats
 
@@ -339,18 +444,35 @@ is retrieval iteration, not reasoning-hop scaling; do not over-read it.
 ## Next experiments (rank order)
 
 CoT supervision (Result 5), its airtight randomized-depth version (Result 6), the free-running
-leak check (Result 6), and the hop-curriculum to 6 hops (Result 7) are done. Remaining:
+leak check (Result 6), the hop-curriculum to 6 hops (Result 7), 2-hop internalisation (Result 8),
+and the probe + register mechanism + 3-hop internalisation + N-loops≈N-hops (Result 10) are done.
+Remaining:
 
-1. **Why does in-state reasoning cap at ~2 hops? (the key open question).** Result 9: 3-hop won't
-   fully internalise (2-hop does; the last 2 hops of a 3-chain do). Is it a hard capacity limit
-   (two intermediates in the recurrent state), or fixable? Try: finer weaning (probabilistic mix of
-   wean_k levels), more steps at wean_k=2, larger d_state / d_model, or checkpoint the good wean_k=1
-   model before advancing. If a bigger core internalises 3-hop, measure whether it then needs r≥3
-   (the N-loops-for-N-hops law, still unmeasured because 3-hop in-state never trained).
-2. **Push the CoT hop-curriculum higher** (--hops 8/10/12) for the externalised ceiling / 0.99^N erosion.
-3. Beyond the toy: relax the typed-disjoint-vocab and clean-permutation assumptions toward realistic
+1. **How deep does in-state reasoning go — where is the real ceiling?** Result 10 removed the false
+   ~2-hop ceiling (3-hop internalises with replay). Push the mixed wean to 4/5/6 hops (`--wean-depth
+   4..6`) and find where it breaks — and whether the break is compute (r must track N), bank
+   interference (~0.99^N, shared with CoT), or loop starvation at deep wean_k (raise `--rd-range`).
+2. **Position-necessity test.** Drop the pause positions after internalising (tail `A v`, no register
+   slots) — the write-once-register account predicts failure. This is the experiment that decides
+   whether "in-state" is really positional/latent-CoT or something more.
+3. **Push the CoT hop-curriculum higher** (--hops 8/10/12) for the externalised ceiling / 0.99^N erosion.
+4. Beyond the toy: relax the typed-disjoint-vocab and clean-permutation assumptions toward realistic
    multi-hop, and vary K / d_model to see what sets the ceilings.
 
 Reproduce: `experiments/diag_2hop.py` (see `--cot --typed-mid --distinct-vals
 --derange --swap` flags, and `--mix-hop1` for the pre-CoT curriculum); arms in
 `recurrent_depth/model.py`. Result JSON/checkpoints land in `results/` (gitignored).
+
+Result 10 specifically:
+
+```
+# 3-hop internalisation with the replaying wean (warm-start from a CoT curriculum ckpt)
+python experiments/diag_nhop.py --wean --wean-mode mixed --wean-depth 3 --hops 6 --k 16 \
+    --load results/run12_curriculum.pt --finetune --random-depth --rd-range 1 8 \
+    --steps 45000 --wean-start 2000 --wean-steps 18000 --ckpt results/run16_wean3_mixed.pt
+# equal-budget ablation: swap --wean-mode mixed -> hop  (isolates schedule vs budget)
+# probe the register mechanism (linear decode of each intermediate by position, per loop)
+python experiments/probe_instate.py --load results/run16_wean3_mixed.pt --hops 3 --applies 8
+# causal check (donor-swap + single-loop patching; forward passes only)
+python experiments/patch_registers.py --load results/run16_wean3_mixed.pt --hops 3
+```
