@@ -13,7 +13,7 @@ This script trains matched pre-norm (the repo's original) and post-norm+inject
   - step_to_95      training convergence (unchanged bookkeeping)
 
 The hypothesis (2602.12078 / STARS 2605.26733): the original pre-norm loop grows
-the residual stream and collapses at higher r; post-norm + input re-injection
+the residual stream and collapses at higher r; post-norm + input feedback
 keeps it bounded and lets accuracy hold (or rise) as r increases.
 
     python experiments/03_test_time_depth.py --smoke                     # tiny fallback A/B
@@ -79,7 +79,7 @@ def main():
                     help="run several seeds (overrides --seed); prints an aggregate")
     ap.add_argument("--batch", type=int, default=64)
     ap.add_argument("--k", type=int, default=32)
-    ap.add_argument("--post", action="store_true", help="post-norm + input re-injection")
+    ap.add_argument("--post", action="store_true", help="post-norm + input feedback (re-add the embedded input each loop)")
     ap.add_argument("--ab", action="store_true", help="run pre-norm vs post-norm and compare")
     ap.add_argument("--rd-ablation", action="store_true",
                     help="isolate randomized-depth training: post+inject FIXED depth vs "

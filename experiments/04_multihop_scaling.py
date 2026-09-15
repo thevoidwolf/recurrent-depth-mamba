@@ -7,7 +7,7 @@ cannot show depth-*scaling* -- "adding loops buys reasoning depth." A flat line 
 1.00 is robustness, not scaling.
 
 This script runs the experiment that can. It trains the same stabilised looped
-model (post-norm + input re-injection + randomized-depth, the recipe from exp 3)
+model (post-norm + input feedback + randomized-depth, the recipe from exp 3)
 on multi-hop retrieval chains, then sweeps test-time depth r and looks for
 accuracy that *rises* with r.
 

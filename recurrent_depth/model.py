@@ -197,7 +197,7 @@ class RecurrentDepthStack(nn.Module):
                  pre- vs post-norm norm-growth diagnostic.
         """
         applies = self.applies if applies is None else applies
-        x0 = x                                    # embedded input, kept for re-injection
+        x0 = x                                    # embedded input, re-added each loop (input feedback)
         total = self.n_distinct * applies
         norms = [] if trace else None
         i = 0

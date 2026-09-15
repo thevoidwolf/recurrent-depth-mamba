@@ -24,12 +24,11 @@ The arc, and what each step actually established (numbers are chain accuracy unl
    (Result 8). **3-hop does not fully internalise** here (the last 2 hops do; the 3rd stalls) — in-state
    reasoning tops out ~2 hops while externalised CoT reaches ≥6 (Result 9).
 
-**Bottom line for Ember:** a looped SSM core can reason multi-hop *below the token layer*, but only
-*shallowly* (≈2 hops in-state here); deep chains are bought by an **external scratchpad**, not by loops
-alone. That supports a reasoning-core-plus-scratchpad/store design, and flags the in-state depth ceiling
-as the thing to push (bigger `d_state`/`d_model`, finer weaning). Method lesson banked: **fixed-depth
-r-sweeps overstate scaling — always confirm with randomized-depth**, and prefer leak-free (free-running)
-evals.
+**Bottom line:** a looped SSM core can reason multi-hop *below the token layer*, but only *shallowly*
+(≈2 hops in-state here); deep chains are bought by an **external scratchpad** (chain-of-thought tokens),
+not by loops alone — so the in-state depth ceiling (bigger `d_state`/`d_model`, finer weaning) is the
+thing to push. Method lesson banked: **fixed-depth r-sweeps overstate scaling — always confirm with
+randomized-depth**, and prefer leak-free (free-running) evals.
 
 ## Question
 
@@ -49,7 +48,7 @@ observe, on tasks of increasing compositional depth.
 **Model.** `TinyLM`: token embedding → looped Mamba-2 core → linear head
 (`d_model=256`, `d_state=64`, `expand=2`, `headdim=64`). Arms are
 `(n_distinct_blocks) × (applies_per_block)`; total forward depth = the product.
-Post-norm + input re-injection (the stabilisers from
+Post-norm + input feedback (re-adding the embedded input before each loop; the stabilisers from
 `experiments/03_test_time_depth.py`) unless noted.
 
 **Tasks** (`recurrent_depth/tasks.py`, and the instrumented
@@ -326,9 +325,9 @@ deep chains.
    position, not a capability limit). But **3-hop does not fully internalise** with this recipe: the
    last 2 hops of a 3-chain go in-state, the 3rd stalls (not loop-budget — eval r=8). So in-state
    reasoning tops out ~2 hops here while externalised CoT reaches ≥6 — **the token scratchpad is what
-   buys depth.** Ember reading: a looped core supports *shallow* in-core reasoning; deep chains want
-   an external scratchpad/store — consistent with a reasoning-core-plus-swappable-store design.
-   Open: is the ~2-hop in-state ceiling a hard capacity limit or a weaning/steps/d_state artifact?
+   buys depth.** Architecturally: a looped core supports *shallow* in-core reasoning; deeper chains
+   want an external scratchpad. Open: is the ~2-hop in-state ceiling a hard capacity limit or a
+   weaning/steps/d_state artifact?
 
 ## Caveats
 
