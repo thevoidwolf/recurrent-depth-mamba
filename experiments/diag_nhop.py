@@ -62,15 +62,21 @@ ap.add_argument("--finetune", action="store_true",
 # soft-weaning: internalise the scratchpad gradually. Fixed depth = --hops. Start full CoT, then
 # ramp wean_k (# of TRAILING intermediates replaced by an unsupervised PAUSE token) 0 -> hops-1.
 # PAUSE keeps the compute position but carries no content, forcing the chain into the recurrent state.
-ap.add_argument("--wean", action="store_true", help="soft-wean CoT -> pause tokens at fixed depth --hops")
+ap.add_argument("--wean", action="store_true", help="soft-wean CoT -> pause tokens at a fixed depth")
+ap.add_argument("--wean-depth", type=int, default=0, help="fixed depth to wean at (0 = use --hops); "
+                "set < --hops to wean a shallow chain while keeping the vocab of a deeper warm-start ckpt")
+ap.add_argument("--wean-mode", choices=["row", "hop"], default="row",
+                help="'row': ramp the FRACTION of fully-internal rows (good for shallow depth); "
+                     "'hop': ramp wean_k, internalising one trailing hop at a time (eases deeper chains in)")
 ap.add_argument("--wean-start", type=int, default=2000, help="steps of full CoT before weaning begins")
-ap.add_argument("--wean-steps", type=int, default=14000, help="steps to ramp wean_k from 0 to hops-1")
+ap.add_argument("--wean-steps", type=int, default=14000, help="steps to ramp the wean 0 -> fully internal")
 args = ap.parse_args()
 
 device = args.device
 torch.backends.cuda.matmul.allow_tf32 = True
 seed_all(args.seed)
 K, H, P = args.k, args.hops, 128
+WD = args.wean_depth if args.wean_depth else H     # depth to wean at (vocab still spans H levels)
 COT = not args.no_cot
 SWAP = not args.no_swap
 PAUSE = BOS                              # reuse BOS (never emitted by these tasks) as the content-free "think" token
@@ -242,32 +248,41 @@ if (not args.load) or args.finetune:
         for pg in opt.param_groups:
             pg["lr"] = lr
         if args.wean:
-            # fixed depth H; soft-wean by ramping the FRACTION p of rows that are fully-internal
-            # (all intermediates -> PAUSE, only value supervised); the rest are full CoT.
+            # soft-wean the depth-WD chain into the recurrent state; two schedules (--wean-mode)
             p = min(1.0, max(0.0, (step - args.wean_start) / max(1, args.wean_steps)))
-            internal_mask = torch.rand(args.batch, generator=depth_gen) < p          # CPU, per-row
-            raw = sample_raw(args.batch, train_gen, H)
-            seq, ans_pos = pack(*raw, h=H, cot=True, internal_mask=internal_mask); seq = seq.to(device)
-            cot_rows = (~internal_mask).to(device)
             r = int(torch.randint(args.rd_range[0], args.rd_range[1] + 1, (1,), generator=depth_gen).item()) \
                 if args.random_depth else None
-            logits = model(seq, applies=r)
-            loss = F.cross_entropy(logits[:, ans_pos - 1], seq[:, ans_pos])          # value: all rows
-            if cot_rows.any():                                                       # intermediates: CoT rows only
-                lg, sq = logits[cot_rows], seq[cot_rows]
-                iloss = sum(F.cross_entropy(lg[:, ans_pos - H + j], sq[:, ans_pos - H + 1 + j])
-                            for j in range(H - 1)) / max(1, H - 1)
-                loss = loss + iloss
+            raw = sample_raw(args.batch, train_gen, WD)
+            if args.wean_mode == "hop":
+                # internalise one trailing hop at a time: wean_k ramps 0 -> WD-1 (deterministic)
+                wean_k = round(p * (WD - 1))
+                seq, ans_pos = pack(*raw, h=WD, cot=True, wean_k=wean_k); seq = seq.to(device)
+                logits = model(seq, applies=r)
+                positions = [ans_pos - WD + j for j in range(WD - 1 - wean_k)] + [ans_pos - 1]
+                loss = sum(F.cross_entropy(logits[:, pp], seq[:, pp + 1]) for pp in positions) / len(positions)
+                prog = f"wean_k={wean_k}/{WD-1}"
+            else:
+                # ramp the FRACTION of rows that are fully-internal; rest are full CoT
+                internal_mask = torch.rand(args.batch, generator=depth_gen) < p
+                seq, ans_pos = pack(*raw, h=WD, cot=True, internal_mask=internal_mask); seq = seq.to(device)
+                cot_rows = (~internal_mask).to(device)
+                logits = model(seq, applies=r)
+                loss = F.cross_entropy(logits[:, ans_pos - 1], seq[:, ans_pos])       # value: all rows
+                if cot_rows.any():                                                    # intermediates: CoT rows only
+                    lg, sq = logits[cot_rows], seq[cot_rows]
+                    loss = loss + sum(F.cross_entropy(lg[:, ans_pos - WD + j], sq[:, ans_pos - WD + 1 + j])
+                                      for j in range(WD - 1)) / max(1, WD - 1)
+                prog = f"p_internal={p:.2f}"
             opt.zero_grad(set_to_none=True); loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); opt.step()
             if (step + 1) % args.eval_every == 0 or step + 1 == args.steps:
-                full = wean_eval(spec["applies_per_block"], eval_gen, h=H, wean_k=H - 1)
-                cotv = wean_eval(spec["applies_per_block"], eval_gen, h=H, wean_k=0)
+                full = wean_eval(spec["applies_per_block"], eval_gen, h=WD, wean_k=WD - 1)
+                cotv = wean_eval(spec["applies_per_block"], eval_gen, h=WD, wean_k=0)
                 print(f"step {step+1:5d} loss {loss.item():.3f} [{time.time()-t0:5.0f}s] "
-                      f"p_internal={p:.2f} value@CoT={cotv:.3f} value@FULL_INTERNAL={full:.3f}", flush=True)
+                      f"{prog} value@CoT={cotv:.3f} value@FULL_INTERNAL={full:.3f}", flush=True)
             if args.ckpt and args.ckpt_every and (step + 1) % args.ckpt_every == 0:
                 torch.save(model.state_dict(), args.ckpt)
-                print(f"  [ckpt] saved at step {step+1} (p_internal={p:.2f})", flush=True)
+                print(f"  [ckpt] saved at step {step+1} ({prog})", flush=True)
             continue
         h = H_cur
         na = _na(h)
@@ -301,14 +316,14 @@ if (not args.load) or args.finetune:
 final = {}
 eval_gen = torch.Generator().manual_seed(args.seed + 30_000)
 if args.wean:
-    print(f"\n=== final (soft-wean, depth {H}): value acc vs wean_k (H-1 = fully internal), then vs r at full internal ===")
-    for wk in range(0, H):
-        accs = {r: wean_eval(r, eval_gen, h=H, wean_k=wk) for r in args.depth_eval}
+    print(f"\n=== final (soft-wean, depth {WD}): value acc vs wean_k (WD-1 = fully internal), then vs r at full internal ===")
+    for wk in range(0, WD):
+        accs = {r: wean_eval(r, eval_gen, h=WD, wean_k=wk) for r in args.depth_eval}
         final[f"wean{wk}"] = accs
         best = max(accs.values())
-        print(f"wean_k={wk} ({'CoT' if wk==0 else 'FULL-INTERNAL' if wk==H-1 else f'{wk} paused'}): "
+        print(f"wean_k={wk} ({'CoT' if wk==0 else 'FULL-INTERNAL' if wk==WD-1 else f'{wk} paused'}): "
               + " ".join(f"r{r}:{accs[r]:.2f}" for r in args.depth_eval) + f"  (best {best:.2f})")
-    print("  ^ wean_k=H-1 row = the internalisation result: value acc with the whole chain in-state, per r.")
+    print("  ^ wean_k=WD-1 row = the internalisation result: value acc with the whole chain in-state, per r.")
     if args.out:
         json.dump({"args": vars(args), "final": final}, open(args.out, "w"), indent=1)
     raise SystemExit

@@ -243,6 +243,30 @@ the key contrast with Result 7: with CoT the depth lives on the **token tape** (
 regardless of chain length, one lookup per token position); internalised, the whole chain resolves
 in the **recurrent state**, so loop count directly gates hop count.
 
+## Result 9 — internalisation has a shallow in-state depth limit (~2 hops here)
+
+Does the internalised, loop-bound behaviour scale to 3 hops (would 3-hop-in-state need r≥3)?
+Soft-wean a 3-hop chain, warm-started from the run12 CoT model (`--wean-depth 3` keeps run12's
+6-level vocab while weaning depth 3). Two schedules:
+
+- **Per-row all-at-once** (`--wean-mode row`, as in Result 8): failed immediately — 3-hop internal
+  flat at ~0.06 through p≈0.37 (2-hop was ~0.9 by then). Flipping a row to "all 3 hops in-state at
+  once" is too abrupt.
+- **Per-hop gradual** (`--wean-mode hop`, internalise one trailing hop at a time): got partway, and
+  revealed the limit. wean_k=1 (last hop internal — the final **2** hops carried in-state, hop-1 on
+  the tape) GROKKED (loss → 0.02). wean_k=2 (all intermediates paused, full 3-hop in-state) STALLED —
+  value flat at bag-of-values (~0.06) for 3500+ steps, and continued training eroded CoT.
+
+So the core internalises **up to ~2 hops** of in-state composition (full 2-hop in Result 8; the last
+2 hops of a 3-chain here) but not a 3rd fully-in-state hop with this recipe. It is **not** a loop
+budget limit (eval used r=8 ≫ 3). Open whether it is a hard in-state capacity limit (carrying two
+intermediates in the recurrent state) or just needs finer weaning / more steps / larger d_state — so
+the "N hops ≈ N loops" law is **not** established (we couldn't get 3-hop in-state to measure it).
+
+The real result is the **contrast**: externalised (CoT) reasoning reaches ≥6 hops (Result 7);
+internalised (in-state) reasoning tops out around **2 hops** here. The token scratchpad is what buys
+deep chains.
+
 ## Conclusions
 
 1. **CoT supervision unlocks composition, which then has a genuine but MODEST
@@ -268,12 +292,16 @@ in the **recurrent state**, so loop count directly gates hop count.
    accelerating per-hop grok), where cold-start couldn't even do 3 (Result 7). With CoT the
    per-lookup test-time compute is ~constant in chain length — depth is externalised to the
    token sequence.
-6. **The core CAN internalise the scratchpad, and then it's loop-bound (Result 8).** Soft-weaning
-   (CoT → content-free pause tokens, gradually) moves the 2-hop chain into the recurrent state
-   (value@internal 0.99) — run13's earlier failure was deleting the compute position, not a
-   capability limit. The internalised chain is **loop-bound**: 2-hop needs ≥2 loops (r=1: 0.06,
-   r=2: 0.97). This is the genuine in-core "loops buy reasoning depth", and the most Ember-relevant
-   regime. Open: does the loop requirement scale (N hops ≈ N loops)? — internalise 3-hop, expect r≥3.
+6. **The core internalises reasoning — but only shallowly (Results 8–9).** Soft-weaning
+   (CoT → content-free pause tokens, gradually) moves a **2-hop** chain fully into the recurrent
+   state (value 0.99), and there it is **loop-bound**: 2-hop needs ≥2 loops (r=1: 0.06, r=2: 0.97) —
+   the genuine in-core "loops buy reasoning depth" (run13's earlier failure was deleting the compute
+   position, not a capability limit). But **3-hop does not fully internalise** with this recipe: the
+   last 2 hops of a 3-chain go in-state, the 3rd stalls (not loop-budget — eval r=8). So in-state
+   reasoning tops out ~2 hops here while externalised CoT reaches ≥6 — **the token scratchpad is what
+   buys depth.** Ember reading: a looped core supports *shallow* in-core reasoning; deep chains want
+   an external scratchpad/store — consistent with a reasoning-core-plus-swappable-store design.
+   Open: is the ~2-hop in-state ceiling a hard capacity limit or a weaning/steps/d_state artifact?
 
 ## Caveats
 
@@ -287,10 +315,12 @@ is retrieval iteration, not reasoning-hop scaling; do not over-read it.
 CoT supervision (Result 5), its airtight randomized-depth version (Result 6), the free-running
 leak check (Result 6), and the hop-curriculum to 6 hops (Result 7) are done. Remaining:
 
-1. **Does the internalised loop requirement scale with hops? (the key open question).** Result 8
-   shows internalised 2-hop needs ≥2 loops. Soft-wean 3-, 4-hop and check whether they need r≥3,
-   r≥4 — an "N hops ≈ N loops" law would be the definitive in-core loops-buy-reasoning-depth result,
-   and would tie the internal ceiling directly to the loop budget (rd_1x8 caps at 8).
+1. **Why does in-state reasoning cap at ~2 hops? (the key open question).** Result 9: 3-hop won't
+   fully internalise (2-hop does; the last 2 hops of a 3-chain do). Is it a hard capacity limit
+   (two intermediates in the recurrent state), or fixable? Try: finer weaning (probabilistic mix of
+   wean_k levels), more steps at wean_k=2, larger d_state / d_model, or checkpoint the good wean_k=1
+   model before advancing. If a bigger core internalises 3-hop, measure whether it then needs r≥3
+   (the N-loops-for-N-hops law, still unmeasured because 3-hop in-state never trained).
 2. **Push the CoT hop-curriculum higher** (--hops 8/10/12) for the externalised ceiling / 0.99^N erosion.
 3. Beyond the toy: relax the typed-disjoint-vocab and clean-permutation assumptions toward realistic
    multi-hop, and vary K / d_model to see what sets the ceilings.
