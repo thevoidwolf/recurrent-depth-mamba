@@ -28,7 +28,11 @@ class CoreConfig:
     d_conv: int = 4
     expand: int = 2
     headdim: int = 64
-    block: str = "auto"   # "auto" -> mamba2 on CUDA else fallback; or force "mamba2"/"fallback"
+    block: str = "auto"   # "auto" -> mamba2 if importable else fallback; or force "mamba2"/"fallback"
+    # --- recurrent-depth stabilizers (all default to the original behaviour) ---
+    norm_position: str = "pre"     # "pre": x + mixer(norm(x));  "post": norm(x + mixer(x))
+    inject_input: bool = False     # re-add the stack input embedding before every apply (Huginn)
+    bptt_window: int | None = None # if set, only backprop through the last k applies (truncated BPTT)
 
 
 class RMSNorm(nn.Module):
@@ -74,7 +78,20 @@ class FallbackMixer(nn.Module):
 def _build_mixer(cfg: CoreConfig, layer_idx: int) -> nn.Module:
     block = cfg.block
     if block == "auto":
-        block = "mamba2" if torch.cuda.is_available() else "fallback"
+        # Prefer the real kernel, but only if it actually imports. On a box with a
+        # GPU visible but no built mamba_ssm (e.g. stock ROCm) the old code crashed
+        # here; now "auto" degrades to the pure-PyTorch scan with a warning instead.
+        block = "fallback"
+        if torch.cuda.is_available():
+            try:
+                from mamba_ssm import Mamba2  # noqa: F401
+                block = "mamba2"
+            except Exception as e:
+                import warnings
+                warnings.warn(
+                    f"mamba_ssm unavailable ({type(e).__name__}: {e}); falling back "
+                    f"to the pure-PyTorch scan. Headline numbers need the real kernel."
+                )
     if block == "mamba2":
         from mamba_ssm import Mamba2
         return Mamba2(d_model=cfg.d_model, d_state=cfg.d_state, d_conv=cfg.d_conv,
@@ -85,13 +102,24 @@ def _build_mixer(cfg: CoreConfig, layer_idx: int) -> nn.Module:
 
 
 class CoreBlock(nn.Module):
-    """Pre-norm residual wrapper around one mixer."""
+    """Residual wrapper around one mixer, pre- or post-norm.
+
+    pre-norm  (original):   x + mixer(norm(x))    -- when the block is unrolled many
+                                                     times the residual stream can grow
+                                                     ~sqrt(depth) and eventually diverge.
+    post-norm (2602.12078): norm(x + mixer(x))    -- bounds the state magnitude across
+                                                     unrolling; the make-or-break
+                                                     stabiliser for looped SSM depth.
+    """
     def __init__(self, cfg: CoreConfig, layer_idx: int):
         super().__init__()
         self.norm = RMSNorm(cfg.d_model)
         self.mixer = _build_mixer(cfg, layer_idx)
+        self.post = (cfg.norm_position == "post")
 
     def forward(self, x):
+        if self.post:
+            return self.norm(x + self.mixer(x))
         return x + self.mixer(self.norm(x))
 
 
@@ -137,6 +165,7 @@ ARM_SPECS = {
     "baseline_4": {"n_distinct": 4, "applies_per_block": 1},  # 4 distinct blocks, each once (the reference)
     "rd_1x4":     {"n_distinct": 1, "applies_per_block": 4},  # 1 block applied 4x (max sharing)
     "rd_2x2":     {"n_distinct": 2, "applies_per_block": 2},  # 2 blocks, each applied 2x (interpolant)
+    "rd_2x4":     {"n_distinct": 2, "applies_per_block": 4},  # 2 blocks, each 4x (8 total applies, one block per hop: composition vs reuse)
     "rd_4x2":     {"n_distinct": 4, "applies_per_block": 2},  # 4 blocks, each 2x (over-compute, same params as baseline)
     "rd_1x8":     {"n_distinct": 1, "applies_per_block": 8},  # 1 block applied 8x (max compute, min params)
 }
@@ -154,14 +183,36 @@ class RecurrentDepthStack(nn.Module):
         super().__init__()
         self.n_distinct = n_distinct
         self.applies = applies_per_block
+        self.inject_input = cfg.inject_input
+        self.bptt_window = cfg.bptt_window
         self.blocks = nn.ModuleList([CoreBlock(cfg, i) for i in range(n_distinct)])
         self.norm_f = RMSNorm(cfg.d_model)
 
-    def forward(self, x):
+    def forward(self, x, applies: int | None = None, trace: bool = False):
+        """Apply each distinct block `applies` times (default: the trained value).
+
+        applies  override the per-block loop count at call time -- drives both
+                 test-time depth sweeps and randomized-depth training.
+        trace    also return the residual-stream RMS after every apply, for the
+                 pre- vs post-norm norm-growth diagnostic.
+        """
+        applies = self.applies if applies is None else applies
+        x0 = x                                    # embedded input, re-added each loop (input feedback)
+        total = self.n_distinct * applies
+        norms = [] if trace else None
+        i = 0
         for blk in self.blocks:
-            for _ in range(self.applies):
-                x = blk(x)
-        return self.norm_f(x)
+            for _ in range(applies):
+                x = blk(x + x0 if self.inject_input else x)
+                i += 1
+                if trace:
+                    norms.append(float(x.detach().pow(2).mean(-1).sqrt().mean()))
+                # Truncated BPTT: cut the graph so gradients reach only the last
+                # `bptt_window` applies -- keeps memory/stability bounded at depth.
+                if self.bptt_window is not None and (total - i) >= self.bptt_window:
+                    x = x.detach()
+        out = self.norm_f(x)
+        return (out, norms) if trace else out
 
 
 class RecurrentDepthLM(nn.Module):
@@ -172,8 +223,12 @@ class RecurrentDepthLM(nn.Module):
         self.core = RecurrentDepthStack(cfg, n_distinct, applies)
         self.head = nn.Linear(cfg.d_model, vocab_size, bias=False)
 
-    def forward(self, tokens):
-        return self.head(self.core(self.embed(tokens)))
+    def forward(self, tokens, applies: int | None = None, trace: bool = False):
+        x = self.embed(tokens)
+        if trace:
+            h, norms = self.core(x, applies=applies, trace=True)
+            return self.head(h), norms
+        return self.head(self.core(x, applies=applies))
 
 
 def make_recurrent_model(vocab_size: int, device, cfg: CoreConfig,
