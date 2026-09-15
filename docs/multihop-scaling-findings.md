@@ -215,6 +215,34 @@ for 6 hops: with CoT each hop is one lookup at its own token position, so per-lo
 compute is ~**independent of chain length**. CoT externalises reasoning depth into the token
 sequence; the loop-count-bound regime is the internalised (no-scratchpad) version.
 
+## Result 8 — soft-weaning internalises 2-hop reasoning, and it is LOOP-BOUND
+
+A first internalise attempt (warm-start CoT then fine-tune on the *plain* task, run13) failed —
+2-hop stuck at bag-of-values (~0.06). But that had a confound: the plain task deleted the
+intermediate token **and its compute position**, leaving zero extra steps to do the hop in-state.
+
+Soft-weaning fixes it: keep the intermediate position but fill it with a content-free **PAUSE**
+token (reused the never-emitted BOS id, so vocab/checkpoints are unchanged), drop its supervision,
+and ramp the fraction of fully-internal rows 0→1 (probabilistic per-row; the remaining CoT rows
+reinforce the chain throughout). h=2 from scratch (`diag_nhop.py --wean`, run14).
+
+`value@FULL_INTERNAL` (2-hop chain solved in-state, intermediate = PAUSE, leak-free by
+construction) climbed *with* the wean and saturated at **0.99** by p=1 — vs run13's 0.06. So the
+looped core **can** do 2-hop composition internally; run13's failure was removing the compute
+budget, not a capability limit.
+
+**And the internalised chain is loop-bound.** Final value acc vs test-time r (fully internal):
+
+| r | 1 | 2 | 3 | 4 | 6 | 8 |
+|---|-----|-----|-----|-----|-----|-----|
+| acc | 0.06 | 0.97 | 1.00 | 1.00 | 1.00 | 1.00 |
+
+r=1 (one loop) fails at bag-of-values; r=2 (two loops) solves it → the internalised 2-hop chain
+needs **≥2 loops ≈ one loop per hop**. This is "loops buy reasoning depth" in the pure sense, and
+the key contrast with Result 7: with CoT the depth lives on the **token tape** (~2 applies
+regardless of chain length, one lookup per token position); internalised, the whole chain resolves
+in the **recurrent state**, so loop count directly gates hop count.
+
 ## Conclusions
 
 1. **CoT supervision unlocks composition, which then has a genuine but MODEST
@@ -239,8 +267,13 @@ sequence; the loop-count-bound regime is the internalised (no-scratchpad) versio
    advancing on mastery reached ≥6-hop chains with no wall (graceful ~0.99^N degradation,
    accelerating per-hop grok), where cold-start couldn't even do 3 (Result 7). With CoT the
    per-lookup test-time compute is ~constant in chain length — depth is externalised to the
-   token sequence; the loop-count limit lives in the **internalised (no-scratchpad)** version,
-   the open frontier.
+   token sequence.
+6. **The core CAN internalise the scratchpad, and then it's loop-bound (Result 8).** Soft-weaning
+   (CoT → content-free pause tokens, gradually) moves the 2-hop chain into the recurrent state
+   (value@internal 0.99) — run13's earlier failure was deleting the compute position, not a
+   capability limit. The internalised chain is **loop-bound**: 2-hop needs ≥2 loops (r=1: 0.06,
+   r=2: 0.97). This is the genuine in-core "loops buy reasoning depth", and the most Ember-relevant
+   regime. Open: does the loop requirement scale (N hops ≈ N loops)? — internalise 3-hop, expect r≥3.
 
 ## Caveats
 
@@ -254,13 +287,13 @@ is retrieval iteration, not reasoning-hop scaling; do not over-read it.
 CoT supervision (Result 5), its airtight randomized-depth version (Result 6), the free-running
 leak check (Result 6), and the hop-curriculum to 6 hops (Result 7) are done. Remaining:
 
-1. **Internalise the scratchpad** (the open frontier). Can the model chain without the explicit
-   intermediate token — latent/implicit CoT, reasoning carried in the recurrent state across
-   loops instead of on the token tape? This is the loop-count-bound regime and the most
-   Ember-relevant (reasoning below the token layer). Likely approach: train with CoT then wean
-   off the intermediate token, or an auxiliary latent loss.
-2. **Push the hop-curriculum higher** (--hops 8/10/12) to find where 0.99^N erosion or a genuine
-   wall actually bites; and vary K / d_model to see what sets the ceiling.
+1. **Does the internalised loop requirement scale with hops? (the key open question).** Result 8
+   shows internalised 2-hop needs ≥2 loops. Soft-wean 3-, 4-hop and check whether they need r≥3,
+   r≥4 — an "N hops ≈ N loops" law would be the definitive in-core loops-buy-reasoning-depth result,
+   and would tie the internal ceiling directly to the loop budget (rd_1x8 caps at 8).
+2. **Push the CoT hop-curriculum higher** (--hops 8/10/12) for the externalised ceiling / 0.99^N erosion.
+3. Beyond the toy: relax the typed-disjoint-vocab and clean-permutation assumptions toward realistic
+   multi-hop, and vary K / d_model to see what sets the ceilings.
 
 Reproduce: `experiments/diag_2hop.py` (see `--cot --typed-mid --distinct-vals
 --derange --swap` flags, and `--mix-hop1` for the pre-CoT curriculum); arms in
